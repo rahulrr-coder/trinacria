@@ -38,6 +38,27 @@ const DEFAULT_WEEKEND = [
   { id: "e5", time: "wind-down", label: "Reading wind-down", cat: "reading", note: "Replaces the late-night scroll." },
 ];
 
+/* ---------- carta del giorno — a daily opening line (offline) ---------- */
+const CARTE = [
+  { it: "Un giorno, tre movimenti.", en: "One day, three movements — hold the order." },
+  { it: "L’ordine regge; l’intensità si piega.", en: "The order holds; the intensity bends." },
+  { it: "Comincia in silenzio — il telefono dopo.", en: "Begin in silence; the phone comes later." },
+  { it: "Una cosa vera basta.", en: "One true thing is enough." },
+  { it: "A mezzogiorno, il mare è profondo.", en: "Go deep at midday — that is the work." },
+  { it: "La sera è per ciò che costruisci.", en: "The evening belongs to what you build." },
+  { it: "Un problema al giorno, nel tempo morto.", en: "One problem a day, slipped into the dead-time." },
+  { it: "Carica il domani, stanotte.", en: "Pre-load tomorrow tonight." },
+  { it: "Riposare nel trogolo è recupero.", en: "Rest at the trough is recovery, not idleness." },
+  { it: "Non un terzo lavoro — respira.", en: "Not a third grind — breathe." },
+  { it: "Mostra il lavoro; il resto segue.", en: "Show the work; the rest follows." },
+  { it: "Piano, ma senza fermarti.", en: "Slowly — but without stopping." },
+];
+const cartaOf = (key) => {
+  let h = 0;
+  for (let i = 0; i < key.length; i++) h = (h * 31 + key.charCodeAt(i)) >>> 0;
+  return CARTE[h % CARTE.length];
+};
+
 /* ---------- date + time ---------- */
 const pad = (n) => String(n).padStart(2, "0");
 const keyOf = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
@@ -132,6 +153,7 @@ export default function Trinacria() {
   const [aiBusy, setAiBusy] = useState(false);
   const [aiErr, setAiErr] = useState("");
   const [dataMsg, setDataMsg] = useState("");
+  const [cartaBusy, setCartaBusy] = useState(false);
   const importRef = useRef(null);
 
   // Sync (GitHub Gist) state
@@ -333,6 +355,24 @@ export default function Trinacria() {
     setAiCfg((p) => ({ ...p, remember }));
     if (remember && apiKey.trim()) await sSet(K_KEY, { key: apiKey.trim() });
     if (!remember) await sDel(K_KEY);
+  };
+
+  /* ---- carta del giorno: a curated line by default; the Consigliere can
+   * author today's if a key is connected. Stored on the day so it syncs. ---- */
+  const carta = log.carta || cartaOf(dKey);
+  const drawCarta = async () => {
+    if (!apiKey.trim() || cartaBusy) return;
+    setCartaBusy(true);
+    try {
+      const out = await askAI({
+        provider: aiCfg.provider, apiKey: apiKey.trim(), model: aiCfg.model,
+        system: "You are Il Consigliere. Write ONE short opening line for Rahul's day — a single sentence under 14 words, a focused intention in your warm, direct voice. No quotes, no preamble, no emoji.",
+        user: buildContext(),
+      });
+      const line = out.split("\n")[0].replace(/^["“'']+|["”'']+$/g, "").trim();
+      if (line) patchLog({ carta: { it: line, en: "" } });
+    } catch { /* keep the curated line */ }
+    finally { setCartaBusy(false); }
   };
 
   const THEME_CYCLE = { auto: "light", light: "notte", notte: "auto" };
@@ -537,6 +577,21 @@ export default function Trinacria() {
           </div>{/* /tr-main */}
 
           <aside className="tr-side">
+
+          {/* ---------------- CARTA DEL GIORNO ---------------- */}
+          <div className="tr-carta">
+            <div className="tr-cartatop">
+              <span className="tr-cartamark">❦</span>
+              <span className="tr-cartalabel">Carta del giorno</span>
+            </div>
+            <p className="tr-cartait">{carta.it}</p>
+            {carta.en && <p className="tr-cartaen">{carta.en}</p>}
+            {apiKey && (
+              <button className="tr-cartadraw" onClick={drawCarta} disabled={cartaBusy}>
+                {cartaBusy ? "il consigliere scrive…" : "✦ let il consigliere write today’s"}
+              </button>
+            )}
+          </div>
 
           {/* ---------------- THE WEEK / STREAK ---------------- */}
           <div className="tr-stats">
@@ -873,6 +928,25 @@ const CSS = `
 .tr-side .tr-consig,.tr-side .tr-eod{margin-top:0;}
 
 /* week / streak */
+/* carta del giorno */
+.tr-carta{position:relative;overflow:hidden;padding:17px 19px;border-radius:16px;
+  background:linear-gradient(160deg,#FCF6E6,#F6EDD6);border:1px solid var(--gold);
+  box-shadow:0 4px 16px var(--shadow);}
+.tr-carta::before{content:"";position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(70% 60% at 100% 0%, var(--accent), transparent 65%);opacity:.10;}
+.tr-cartatop{display:flex;align-items:center;gap:8px;margin-bottom:9px;}
+.tr-cartamark{color:var(--gold);font-size:15px;}
+.tr-cartalabel{font-family:"Fraunces",serif;font-style:italic;font-size:12px;font-weight:600;
+  color:var(--gold);text-transform:lowercase;letter-spacing:.04em;}
+.tr-cartait{margin:0;font-family:"Fraunces",serif;font-weight:600;font-size:18.5px;line-height:1.32;
+  color:var(--ink);letter-spacing:-.005em;}
+.tr-cartaen{margin:6px 0 0;font-size:12.5px;line-height:1.5;color:var(--soft);}
+.tr-cartadraw{margin-top:11px;background:transparent;border:0;color:var(--gold);font-size:11.5px;
+  font-weight:600;cursor:pointer;padding:0;letter-spacing:.02em;border-bottom:1px solid transparent;transition:.15s;}
+.tr-cartadraw:hover:not(:disabled){border-bottom-color:var(--gold);}
+.tr-cartadraw:disabled{opacity:.6;cursor:default;font-style:italic;font-family:"Fraunces",serif;}
+.tr-root[data-appearance="dark"] .tr-carta{background:linear-gradient(160deg,#241C10,#1E1710);}
+
 .tr-stats{padding:16px 18px;border-radius:16px;background:linear-gradient(160deg,#FFFCF2,#F7EFD9);
   border:1px solid var(--line);box-shadow:0 1px 3px var(--shadow);}
 .tr-statshead{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:13px;}
