@@ -6,9 +6,14 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <meta name="theme-color" content="#FAF3E4" />
     <title>Trinacria — your day in three movements</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Fraunces:ital,opsz,wght@0,9..144,500;0,9..144,600;0,9..144,900;1,9..144,500;1,9..144,600&family=Hanken+Grotesk:wght@400;500;600;700&display=swap" />
     <style>
       html, body { margin: 0; padding: 0; background: #FAF3E4; }
       #root { min-height: 100vh; }
+      /* tiny pre-paint guard: keep the page calm and on-font before React mounts */
+      body { font-family: "Hanken Grotesk", system-ui, sans-serif; color: #33271A; }
     </style>
   </head>
   <body>
