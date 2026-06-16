@@ -216,6 +216,12 @@ export default function Trinacria() {
     document.body.style.background = appearance === "dark" ? "#0F0B06" : "#FAF3E4";
     document.querySelector('meta[name="theme-color"]')?.setAttribute("content", appearance === "dark" ? "#16110A" : "#FAF3E4");
   }, [appearance]);
+  useEffect(() => {
+    if (!settingsOpen) return;
+    const onKey = (e) => { if (e.key === "Escape") { setSettingsOpen(false); setDataMsg(""); } };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [settingsOpen]);
 
   const patchLog = (patch) => setLogs((prev) => { const cur = prev[dKey] || { done: {}, note: {}, reflection: "" }; return { ...prev, [dKey]: { ...cur, ...patch, updatedAt: Date.now() } }; });
   const toggleDone = (id) => patchLog({ done: { ...log.done, [id]: !log.done[id] } });
@@ -424,80 +430,101 @@ export default function Trinacria() {
 
       {/* ---------------- SETTINGS DRAWER ---------------- */}
       {settingsOpen && (
-        <div className="tr-settings">
-          <div className="tr-setrow">
-            <span className="tr-setlabel">Theme</span>
-            <div className="tr-provsel">
-              {["auto", "light", "notte"].map((m) => (
-                <button key={m} className={`tr-prov ${themeMode === m ? "on" : ""}`}
-                  onClick={() => setAiCfg((p) => ({ ...p, theme: m }))}>{m[0].toUpperCase() + m.slice(1)}</button>
-              ))}
+        <div className="tr-modal" onClick={(e) => { if (e.target === e.currentTarget) { setSettingsOpen(false); setDataMsg(""); } }}>
+          <div className="tr-modalcard" role="dialog" aria-modal="true" aria-label="Settings">
+            <div className="tr-modalhead">
+              <h2 className="tr-modaltitle">Impostazioni</h2>
+              <button className="tr-modalclose" onClick={() => { setSettingsOpen(false); setDataMsg(""); }} aria-label="Close settings">✕</button>
+            </div>
+            <div className="tr-modalbody">
+
+              <section className="tr-section">
+                <h3 className="tr-sectitle">Appearance</h3>
+                <div className="tr-setrow">
+                  <span className="tr-setlabel">Theme</span>
+                  <div className="tr-provsel">
+                    {["auto", "light", "notte"].map((m) => (
+                      <button key={m} className={`tr-prov ${themeMode === m ? "on" : ""}`}
+                        onClick={() => setAiCfg((p) => ({ ...p, theme: m }))}>{m[0].toUpperCase() + m.slice(1)}</button>
+                    ))}
+                  </div>
+                </div>
+                <p className="tr-setnote">Auto follows your device clock — saffron at dawn, cobalt by day, candle-lit at night.</p>
+                <label className="tr-remember">
+                  <input type="checkbox" checked={notify} onChange={(e) => toggleNotify(e.target.checked)} />
+                  <span>Nudge me when a block begins (while open)</span>
+                </label>
+              </section>
+
+              <section className="tr-section">
+                <h3 className="tr-sectitle">Il Consigliere · AI</h3>
+                <div className="tr-setrow">
+                  <span className="tr-setlabel">Provider</span>
+                  <div className="tr-provsel">
+                    {Object.keys(PROVIDERS).map((k) => (
+                      <button key={k} className={`tr-prov ${aiCfg.provider === k ? "on" : ""}`}
+                        onClick={() => setAiCfg((p) => ({ ...p, provider: k, model: PROVIDERS[k].models[0] }))}>{PROVIDERS[k].name}</button>
+                    ))}
+                  </div>
+                </div>
+                <div className="tr-setrow">
+                  <span className="tr-setlabel">Model</span>
+                  <select className="tr-modelsel" value={aiCfg.model} onChange={(e) => setAiCfg((p) => ({ ...p, model: e.target.value }))}>
+                    {PROVIDERS[aiCfg.provider].models.map((m) => <option key={m} value={m}>{m}</option>)}
+                  </select>
+                </div>
+                <div className="tr-setrow">
+                  <span className="tr-setlabel">API key</span>
+                  <input className="tr-keyinput" type="password" value={apiKey} placeholder={PROVIDERS[aiCfg.provider].keyHint}
+                    onChange={(e) => setApiKey(e.target.value)} />
+                </div>
+                <label className="tr-remember">
+                  <input type="checkbox" checked={aiCfg.remember} onChange={(e) => saveKeyToggle(e.target.checked)} />
+                  <span>Save key on this device</span>
+                </label>
+                <p className="tr-setnote">Stored only here, for you. Get a key at <b>{PROVIDERS[aiCfg.provider].console}</b>.</p>
+              </section>
+
+              <section className="tr-section">
+                <h3 className="tr-sectitle">Sync · across devices</h3>
+                <p className="tr-setnote">Keep your day in step on phone and laptop through a <b>private GitHub gist</b>. Use a token with <b>only the gist scope</b>.</p>
+                <div className="tr-setrow">
+                  <span className="tr-setlabel">Token</span>
+                  <input className="tr-keyinput" type="password" value={ghToken} placeholder="github_pat_… / ghp_…"
+                    onChange={(e) => setGhToken(e.target.value)} />
+                </div>
+                {gh.gistId ? (
+                  <div className="tr-syncrow">
+                    <span className={`tr-syncstat is-${syncState}`}><i className="tr-syncdot" />{syncLabel}</span>
+                    <button className="tr-databtn" onClick={syncNow} disabled={syncState === "syncing"}>Sync now</button>
+                    <button className="tr-databtn" onClick={disconnectGist}>Disconnect</button>
+                  </div>
+                ) : (
+                  <button className="tr-connect" onClick={connectGist} disabled={syncState === "syncing"}>
+                    {syncState === "syncing" ? "Connecting…" : "Connect & sync"}
+                  </button>
+                )}
+                {syncErr && <p className="tr-datamsg tr-syncerr">{syncErr}</p>}
+                {gh.gistId && <p className="tr-setnote">Linked gist <b>{gh.gistId.slice(0, 8)}…</b> · token stays only in this browser.</p>}
+              </section>
+
+              <section className="tr-section">
+                <h3 className="tr-sectitle">Your data</h3>
+                <p className="tr-setnote">Everything lives in this browser. Download a backup to keep it safe — or carry it to another device.</p>
+                <div className="tr-databtns">
+                  <button className="tr-databtn" onClick={exportData}>⤓ Export backup</button>
+                  <button className="tr-databtn" onClick={() => importRef.current?.click()}>⤒ Import backup</button>
+                  <input ref={importRef} type="file" accept="application/json,.json" hidden
+                    onChange={(e) => { importData(e.target.files?.[0]); e.target.value = ""; }} />
+                </div>
+                {dataMsg && <p className="tr-datamsg">{dataMsg}</p>}
+              </section>
+
+            </div>
+            <div className="tr-modalfoot">
+              <button className="tr-setdone" onClick={() => { setSettingsOpen(false); setDataMsg(""); }}>Done</button>
             </div>
           </div>
-          <p className="tr-setnote">Auto follows your device clock — saffron at dawn, cobalt by day, candle-lit at night.</p>
-          <label className="tr-remember">
-            <input type="checkbox" checked={notify} onChange={(e) => toggleNotify(e.target.checked)} />
-            <span>Nudge me when a block begins (while open)</span>
-          </label>
-          <div className="tr-setdivider"><span>Consigliere · AI</span></div>
-          <div className="tr-setrow">
-            <span className="tr-setlabel">Provider</span>
-            <div className="tr-provsel">
-              {Object.keys(PROVIDERS).map((k) => (
-                <button key={k} className={`tr-prov ${aiCfg.provider === k ? "on" : ""}`}
-                  onClick={() => setAiCfg((p) => ({ ...p, provider: k, model: PROVIDERS[k].models[0] }))}>{PROVIDERS[k].name}</button>
-              ))}
-            </div>
-          </div>
-          <div className="tr-setrow">
-            <span className="tr-setlabel">Model</span>
-            <select className="tr-modelsel" value={aiCfg.model} onChange={(e) => setAiCfg((p) => ({ ...p, model: e.target.value }))}>
-              {PROVIDERS[aiCfg.provider].models.map((m) => <option key={m} value={m}>{m}</option>)}
-            </select>
-          </div>
-          <div className="tr-setrow">
-            <span className="tr-setlabel">API key</span>
-            <input className="tr-keyinput" type="password" value={apiKey} placeholder={PROVIDERS[aiCfg.provider].keyHint}
-              onChange={(e) => setApiKey(e.target.value)} />
-          </div>
-          <label className="tr-remember">
-            <input type="checkbox" checked={aiCfg.remember} onChange={(e) => saveKeyToggle(e.target.checked)} />
-            <span>Save key on this device</span>
-          </label>
-          <p className="tr-setnote">Stored only here, for you. Get a key at <b>{PROVIDERS[aiCfg.provider].console}</b>. Browser calls can fail on CORS — if so, that’s the provider, not the key.</p>
-
-          <div className="tr-setdivider"><span>Your data</span></div>
-          <p className="tr-setnote">Everything lives in this browser only. Download a backup to keep it safe — or move it to another device.</p>
-          <div className="tr-databtns">
-            <button className="tr-databtn" onClick={exportData}>⤓ Export backup</button>
-            <button className="tr-databtn" onClick={() => importRef.current?.click()}>⤒ Import backup</button>
-            <input ref={importRef} type="file" accept="application/json,.json" hidden
-              onChange={(e) => { importData(e.target.files?.[0]); e.target.value = ""; }} />
-          </div>
-          {dataMsg && <p className="tr-datamsg">{dataMsg}</p>}
-
-          <div className="tr-setdivider"><span>Sync · across devices</span></div>
-          <p className="tr-setnote">Keep your day in step on phone and laptop through a <b>private GitHub gist</b>. Create a token with <b>only the gist scope</b> at <b>github.com/settings/tokens</b>.</p>
-          <div className="tr-setrow">
-            <span className="tr-setlabel">Token</span>
-            <input className="tr-keyinput" type="password" value={ghToken} placeholder="github_pat_… / ghp_…"
-              onChange={(e) => setGhToken(e.target.value)} />
-          </div>
-          {gh.gistId ? (
-            <div className="tr-syncrow">
-              <span className={`tr-syncstat is-${syncState}`}><i className="tr-syncdot" />{syncLabel}</span>
-              <button className="tr-databtn" onClick={syncNow} disabled={syncState === "syncing"}>Sync now</button>
-              <button className="tr-databtn" onClick={disconnectGist}>Disconnect</button>
-            </div>
-          ) : (
-            <button className="tr-connect" onClick={connectGist} disabled={syncState === "syncing"}>
-              {syncState === "syncing" ? "Connecting…" : "Connect & sync"}
-            </button>
-          )}
-          {syncErr && <p className="tr-datamsg tr-syncerr">{syncErr}</p>}
-          {gh.gistId && <p className="tr-setnote">Linked gist <b>{gh.gistId.slice(0, 8)}…</b> · token stays only in this browser. Use a dedicated gist-only token; don’t connect on a shared machine.</p>}
-
-          <button className="tr-setdone" onClick={() => { setSettingsOpen(false); setDataMsg(""); }}>Done</button>
         </div>
       )}
 
@@ -781,7 +808,7 @@ const CSS = `
   --ivory:#FAF3E4; --cream:#FFFCF4; --ink:#33271A; --soft:#7A6A52; --faint:#A89878;
   --border:#EADFC6; --line:#E2D4B6; --gold:#B8912F; --goldlite:#D4AF37; --golddeep:#8C6D1F;
   --shadow:rgba(120,90,40,.13);
-  max-width:1180px; margin:26px auto; padding:40px 48px 48px;
+  max-width:1180px; margin:26px auto; padding:46px 60px 56px;
   border-radius:22px;
   border:1px solid var(--line);
   box-shadow:0 24px 70px rgba(120,90,40,.18), 0 2px 0 #fff inset;
@@ -846,7 +873,7 @@ const CSS = `
 .tr-root[data-appearance="dark"] .tr-consig{background:linear-gradient(160deg,#241C10,#1E1710);}
 
 /* header */
-.tr-head{display:flex;align-items:flex-start;gap:16px;margin-bottom:18px;position:relative;}
+.tr-head{display:flex;align-items:flex-start;gap:18px;margin-bottom:26px;position:relative;}
 .tr-emblem{flex:0 0 64px;filter:drop-shadow(0 2px 5px var(--shadow));animation:embin 1s cubic-bezier(.2,.8,.2,1) both;}
 @keyframes embin{from{opacity:0;transform:rotate(-40deg) scale(.7);}to{opacity:1;transform:none;}}
 .tr-armlive{filter:drop-shadow(0 0 5px currentColor);}
@@ -872,8 +899,8 @@ const CSS = `
 .tr-root[data-appearance="dark"] .tr-theme:hover{background:#2A2012;}
 
 /* ribbon */
-.tr-ribbon{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-bottom:20px;
-  padding:11px 14px;background:linear-gradient(180deg,#FFFCF2,#FBF4E2);
+.tr-ribbon{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-bottom:30px;
+  padding:13px 16px;background:linear-gradient(180deg,#FFFCF2,#FBF4E2);
   border:1px solid var(--line);border-radius:14px;box-shadow:0 1px 3px var(--shadow);
   position:relative;}
 .tr-ribbon::before,.tr-ribbon::after{content:"";position:absolute;left:14px;right:14px;height:1px;
@@ -890,29 +917,46 @@ const CSS = `
 .tr-rpill.loose{font-size:13px;}
 .tr-loosehint{font-family:"Fraunces",serif;font-style:italic;color:var(--gold);font-size:12.5px;margin-left:3px;}
 
-/* settings */
-.tr-settings{background:var(--cream);border:1px solid var(--gold);border-radius:14px;
-  padding:16px 17px;margin-bottom:18px;box-shadow:0 6px 20px var(--shadow);animation:drop .25s ease;}
+/* settings — a calm, sectioned modal */
 @keyframes drop{from{opacity:0;transform:translateY(-6px);}to{opacity:1;transform:none;}}
-.tr-setrow{display:flex;align-items:center;gap:12px;margin-bottom:11px;}
+.tr-modal{position:fixed;inset:0;z-index:50;display:flex;align-items:flex-start;justify-content:center;
+  padding:6vh 18px;background:rgba(38,26,10,.44);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px);
+  overflow-y:auto;animation:fade .2s ease;}
+.tr-modalcard{width:100%;max-width:540px;background:var(--cream);border:1px solid var(--gold);
+  border-radius:20px;box-shadow:0 30px 80px rgba(50,34,10,.42);overflow:hidden;animation:drop .25s ease;}
+.tr-modalhead{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  padding:22px 28px;border-bottom:1px solid var(--line);}
+.tr-modaltitle{margin:0;font-family:"Fraunces",serif;font-style:italic;font-weight:600;font-size:23px;
+  color:var(--ink);letter-spacing:-.01em;}
+.tr-modalclose{width:34px;height:34px;border-radius:50%;border:1px solid var(--line);background:var(--ivory);
+  color:var(--soft);font-size:13px;cursor:pointer;transition:.15s;flex:0 0 34px;}
+.tr-modalclose:hover{border-color:var(--gold);color:var(--ink);}
+.tr-modalbody{padding:6px 28px;max-height:66vh;overflow-y:auto;}
+.tr-section{padding:22px 0;border-bottom:1px solid var(--line);}
+.tr-section:last-child{border-bottom:0;}
+.tr-sectitle{margin:0 0 16px;font-size:11px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.13em;color:var(--gold);}
+.tr-modalfoot{padding:18px 28px;border-top:1px solid var(--line);display:flex;justify-content:flex-end;}
+.tr-setrow{display:flex;align-items:center;gap:14px;margin-bottom:14px;}
 .tr-setlabel{flex:0 0 78px;font-size:12px;font-weight:600;color:var(--soft);text-transform:uppercase;letter-spacing:.06em;}
-.tr-provsel{display:flex;gap:6px;}
-.tr-prov{padding:7px 14px;border:1px solid var(--line);background:var(--ivory);border-radius:9px;
+.tr-provsel{display:flex;gap:7px;}
+.tr-prov{padding:8px 15px;border:1px solid var(--line);background:var(--ivory);border-radius:9px;
   font-size:13px;font-weight:600;color:var(--soft);cursor:pointer;transition:.15s;}
 .tr-prov.on{background:var(--ink);color:var(--cream);border-color:var(--ink);}
-.tr-modelsel,.tr-keyinput{flex:1;padding:9px 11px;border:1px solid var(--line);border-radius:9px;
+.tr-modelsel,.tr-keyinput{flex:1;padding:10px 12px;border:1px solid var(--line);border-radius:9px;
   background:var(--ivory);color:var(--ink);font-size:13px;font-family:inherit;}
-.tr-remember{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--soft);margin:4px 0 8px;cursor:pointer;}
+.tr-remember{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--soft);margin:12px 0 0;cursor:pointer;}
 .tr-remember input{accent-color:var(--gold);width:15px;height:15px;}
-.tr-setnote{font-size:11.5px;color:var(--faint);line-height:1.5;margin:0 0 12px;}
+.tr-setnote{font-size:12px;color:var(--faint);line-height:1.55;margin:10px 0 0;}
 .tr-setnote b{color:var(--soft);}
-.tr-setdone{padding:9px 18px;background:var(--gold);color:#fff;border:0;border-radius:9px;
+.tr-section .tr-setnote:first-of-type{margin-top:0;margin-bottom:14px;}
+.tr-setdone{padding:11px 26px;background:var(--gold);color:#fff;border:0;border-radius:10px;
   font-size:13px;font-weight:700;cursor:pointer;}
 .tr-setdone:hover{background:var(--golddeep);}
 
 /* tabs */
 .tr-tabs{display:flex;gap:5px;background:#F3E9D2;border:1px solid var(--line);
-  border-radius:12px;padding:5px;margin-bottom:18px;}
+  border-radius:12px;padding:5px;margin-bottom:30px;}
 .tr-tab{flex:1;padding:10px;border:0;background:transparent;border-radius:8px;cursor:pointer;
   font-family:"Fraunces",serif;font-weight:600;font-size:15px;color:var(--soft);transition:.18s;}
 .tr-tab.on{background:var(--cream);color:var(--ink);box-shadow:0 1px 4px var(--shadow);}
@@ -922,14 +966,14 @@ const CSS = `
 @keyframes fade{from{opacity:0;transform:translateY(5px);}to{opacity:1;transform:none;}}
 
 /* ---- two-column sprawl: timeline + consigliere rail ---- */
-.tr-layout{display:grid;grid-template-columns:minmax(0,1fr) 384px;gap:30px;align-items:start;}
+.tr-layout{display:grid;grid-template-columns:minmax(0,1fr) 384px;gap:40px;align-items:start;}
 .tr-main{min-width:0;}
-.tr-side{position:sticky;top:24px;display:flex;flex-direction:column;gap:20px;min-width:0;}
+.tr-side{position:sticky;top:24px;display:flex;flex-direction:column;gap:24px;min-width:0;}
 .tr-side .tr-consig,.tr-side .tr-eod{margin-top:0;}
 
 /* week / streak */
 /* carta del giorno */
-.tr-carta{position:relative;overflow:hidden;padding:17px 19px;border-radius:16px;
+.tr-carta{position:relative;overflow:hidden;padding:20px 22px;border-radius:16px;
   background:linear-gradient(160deg,#FCF6E6,#F6EDD6);border:1px solid var(--gold);
   box-shadow:0 4px 16px var(--shadow);}
 .tr-carta::before{content:"";position:absolute;inset:0;pointer-events:none;
@@ -947,7 +991,7 @@ const CSS = `
 .tr-cartadraw:disabled{opacity:.6;cursor:default;font-style:italic;font-family:"Fraunces",serif;}
 .tr-root[data-appearance="dark"] .tr-carta{background:linear-gradient(160deg,#241C10,#1E1710);}
 
-.tr-stats{padding:16px 18px;border-radius:16px;background:linear-gradient(160deg,#FFFCF2,#F7EFD9);
+.tr-stats{padding:18px 20px;border-radius:16px;background:linear-gradient(160deg,#FFFCF2,#F7EFD9);
   border:1px solid var(--line);box-shadow:0 1px 3px var(--shadow);}
 .tr-statshead{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:13px;}
 .tr-statstitle{margin:0;font-family:"Fraunces",serif;font-style:italic;font-weight:600;font-size:17px;color:var(--ink);letter-spacing:-.01em;}
@@ -991,7 +1035,7 @@ const CSS = `
 .tr-syncerr{color:#A53B27;font-style:normal;}
 
 /* date nav */
-.tr-daynav{display:flex;align-items:center;gap:10px;margin-bottom:16px;}
+.tr-daynav{display:flex;align-items:center;gap:10px;margin-bottom:22px;}
 .tr-arrow{width:36px;height:36px;border:1px solid var(--line);background:var(--cream);
   color:var(--ink);border-radius:10px;font-size:19px;cursor:pointer;transition:.15s;box-shadow:0 1px 2px var(--shadow);}
 .tr-arrow:hover{background:#FFF8E4;border-color:var(--gold);}
@@ -1004,7 +1048,7 @@ const CSS = `
 .tr-todaybtn:hover{border-color:var(--gold);color:var(--ink);}
 
 /* progress */
-.tr-progress{display:flex;align-items:center;gap:13px;margin-bottom:22px;}
+.tr-progress{display:flex;align-items:center;gap:13px;margin-bottom:28px;}
 .tr-pbar{flex:1;height:7px;background:#EFE3CB;border-radius:999px;overflow:hidden;
   box-shadow:inset 0 1px 2px rgba(120,90,40,.12);}
 .tr-pbar span{display:block;height:100%;border-radius:999px;transition:width .5s cubic-bezier(.2,.8,.2,1);
@@ -1036,7 +1080,7 @@ const CSS = `
 .tr-node.pulse{box-shadow:0 0 0 0 var(--c);animation:npulse 2.2s infinite;}
 @keyframes npulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--c) 55%,transparent);}70%{box-shadow:0 0 0 9px transparent;}100%{box-shadow:0 0 0 0 transparent;}}
 
-.tr-tile{flex:1;display:flex;gap:13px;padding:14px 15px;margin-bottom:11px;border-radius:14px;
+.tr-tile{flex:1;display:flex;gap:13px;padding:16px 18px;margin-bottom:14px;border-radius:14px;
   background:linear-gradient(180deg,var(--cream),#FFFAEF);
   border:1px solid var(--border);border-left:4px solid var(--c);
   box-shadow:0 1px 3px var(--shadow);transition:transform .2s,box-shadow .2s,border-color .2s;}
@@ -1074,7 +1118,7 @@ const CSS = `
   border-left:2px solid var(--gold);border-radius:0 7px 7px 0;padding:8px 11px;line-height:1.5;}
 
 /* consigliere */
-.tr-consig{margin-top:24px;padding:18px 18px 16px;border-radius:16px;position:relative;
+.tr-consig{margin-top:24px;padding:22px 22px 20px;border-radius:16px;position:relative;
   background:linear-gradient(160deg,#FCF6E6,#F7EFD9);border:1px solid var(--gold);
   box-shadow:0 4px 18px var(--shadow);overflow:hidden;}
 .tr-consig::before{content:"";position:absolute;inset:0;pointer-events:none;
@@ -1106,7 +1150,7 @@ const CSS = `
 .tr-aihint{margin:11px 0 0;font-size:12.5px;color:var(--soft);line-height:1.5;}
 
 /* end of day */
-.tr-eod{margin-top:22px;padding:17px 18px;border-radius:15px;background:var(--cream);
+.tr-eod{margin-top:22px;padding:20px 22px;border-radius:15px;background:var(--cream);
   border:1px solid var(--border);box-shadow:0 1px 3px var(--shadow);}
 .tr-eodtitle{margin:0 0 12px;font-family:"Fraunces",serif;font-weight:600;font-size:18px;letter-spacing:-.01em;}
 .tr-wins{list-style:none;margin:0 0 13px;padding:0;}
