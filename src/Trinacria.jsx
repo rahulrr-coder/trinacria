@@ -51,14 +51,31 @@ function blockSpan(t) {
   if (e === 0) e = 1440; return [s, e];
 }
 
+/* ---------- weekly stats + streak ---------- */
+function dayStats(logs, templates, date) {
+  const k = keyOf(date);
+  const l = logs[k];
+  const tpl = isWeekend(date) ? templates.weekend : templates.weekday;
+  const total = tpl.length || 1;
+  const done = l ? Object.values(l.done || {}).filter(Boolean).length : 0;
+  return { key: k, date, done, total, pct: Math.round((done / total) * 100) };
+}
+function computeStreak(logs, templates, today) {
+  let streak = 0;
+  let d = new Date(today);
+  if (dayStats(logs, templates, d).done === 0) d = addDays(d, -1); // today may be in progress
+  while (dayStats(logs, templates, d).done > 0) { streak++; d = addDays(d, -1); }
+  return streak;
+}
+
 /* ---------- storage (browser localStorage) ---------- */
 const K_T = "trinacria_templates_v1";
 const K_L = "trinacria_logs_v1";
 const K_AI = "trinacria_ai_v1";
 const K_KEY = "trinacria_aikey_v1";
 async function sGet(k) { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : null; } catch { return null; } }
-async function sSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} }
-async function sDel(k) { try { localStorage.removeItem(k); } catch {} }
+async function sSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* storage full or unavailable */ return false; } }
+async function sDel(k) { try { localStorage.removeItem(k); } catch { /* storage unavailable */ return false; } }
 
 /* ---------- AI providers ---------- */
 const PROVIDERS = {
@@ -104,6 +121,8 @@ export default function Trinacria() {
   const [aiOut, setAiOut] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
   const [aiErr, setAiErr] = useState("");
+  const [dataMsg, setDataMsg] = useState("");
+  const importRef = useRef(null);
 
   useEffect(() => {
     let alive = true;
@@ -152,6 +171,39 @@ export default function Trinacria() {
   const resetTemplate = (w) => setList(w, (w === "weekday" ? DEFAULT_WEEKDAY : DEFAULT_WEEKEND).map((b) => ({ ...b })));
 
   const wins = tpl.filter((b) => log.done[b.id]);
+
+  /* ---- weekly stats (sidebar) — last 7 days ending today ---- */
+  const week = [];
+  for (let i = 6; i >= 0; i--) week.push(dayStats(logs, templates, addDays(now, -i)));
+  const streak = computeStreak(logs, templates, now);
+
+  /* ---- backup: export / import ---- */
+  const exportData = () => {
+    const payload = {
+      app: "trinacria", version: 1, exportedAt: new Date().toISOString(),
+      templates, logs, aiCfg: { provider: aiCfg.provider, model: aiCfg.model },
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url; a.download = `trinacria-backup-${keyOf(new Date())}.json`;
+    document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    setDataMsg("Backup downloaded.");
+  };
+  const importData = (file) => {
+    if (!file) return;
+    const r = new FileReader();
+    r.onload = () => {
+      try {
+        const d = JSON.parse(String(r.result));
+        if (d.templates?.weekday && d.templates?.weekend) setTemplates(d.templates);
+        if (d.logs && typeof d.logs === "object") setLogs(d.logs);
+        if (d.aiCfg) setAiCfg((p) => ({ ...p, ...d.aiCfg }));
+        setDataMsg("Restored from backup.");
+      } catch { setDataMsg("That file isn’t a Trinacria backup."); }
+    };
+    r.readAsText(file);
+  };
 
   /* ---- AI plumbing ---- */
   const buildContext = () => {
@@ -246,7 +298,18 @@ export default function Trinacria() {
             <span>Save key on this device</span>
           </label>
           <p className="tr-setnote">Stored only here, for you. Get a key at <b>{PROVIDERS[aiCfg.provider].console}</b>. Browser calls can fail on CORS — if so, that’s the provider, not the key.</p>
-          <button className="tr-setdone" onClick={() => setSettingsOpen(false)}>Done</button>
+
+          <div className="tr-setdivider"><span>Your data</span></div>
+          <p className="tr-setnote">Everything lives in this browser only. Download a backup to keep it safe — or move it to another device.</p>
+          <div className="tr-databtns">
+            <button className="tr-databtn" onClick={exportData}>⤓ Export backup</button>
+            <button className="tr-databtn" onClick={() => importRef.current?.click()}>⤒ Import backup</button>
+            <input ref={importRef} type="file" accept="application/json,.json" hidden
+              onChange={(e) => { importData(e.target.files?.[0]); e.target.value = ""; }} />
+          </div>
+          {dataMsg && <p className="tr-datamsg">{dataMsg}</p>}
+
+          <button className="tr-setdone" onClick={() => { setSettingsOpen(false); setDataMsg(""); }}>Done</button>
         </div>
       )}
 
@@ -258,6 +321,8 @@ export default function Trinacria() {
 
       {tab === "today" ? (
         <section className="tr-panel" key="today">
+         <div className="tr-layout">
+          <div className="tr-main">
           {/* date nav */}
           <div className="tr-daynav">
             <button className="tr-arrow" onClick={() => setViewDate(addDays(viewDate, -1))} aria-label="Previous day">‹</button>
@@ -321,6 +386,37 @@ export default function Trinacria() {
               );
             })}
           </ol>
+          </div>{/* /tr-main */}
+
+          <aside className="tr-side">
+
+          {/* ---------------- THE WEEK / STREAK ---------------- */}
+          <div className="tr-stats">
+            <div className="tr-statshead">
+              <h2 className="tr-statstitle">La settimana</h2>
+              <span className="tr-streak" title="Consecutive days with at least one block done">
+                <span className="tr-flame">♛</span>{streak} day{streak === 1 ? "" : "s"}
+              </span>
+            </div>
+            <div className="tr-week">
+              {week.map((d) => {
+                const isToday = sameDay(d.date, now);
+                const isView = sameDay(d.date, viewDate);
+                return (
+                  <button key={d.key} className={`tr-wcol ${isView ? "view" : ""}`}
+                    title={`${dayLabel(d.date)} — ${d.done}/${d.total}`}
+                    onClick={() => { setViewDate(new Date(d.date)); }}>
+                    <span className="tr-wtrack">
+                      <span className={`tr-wfill ${d.pct === 100 ? "full" : ""}`} style={{ height: `${Math.max(d.pct, d.done ? 8 : 0)}%` }} />
+                    </span>
+                    <span className={`tr-wday ${isToday ? "on" : ""}`}>
+                      {d.date.toLocaleDateString(undefined, { weekday: "narrow" })}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
 
           {/* ---------------- IL CONSIGLIERE ---------------- */}
           <div className="tr-consig">
@@ -365,6 +461,9 @@ export default function Trinacria() {
               placeholder="one honest line about today — what worked, what slipped, what to pre-load."
               onChange={(e) => setReflection(e.target.value)} />
           </div>
+
+          </aside>{/* /tr-side */}
+         </div>{/* /tr-layout */}
         </section>
       ) : (
         <section className="tr-panel" key="plan">
@@ -473,13 +572,27 @@ const CSS = `
   --ivory:#FAF3E4; --cream:#FFFCF4; --ink:#33271A; --soft:#7A6A52; --faint:#A89878;
   --border:#EADFC6; --line:#E2D4B6; --gold:#B8912F; --goldlite:#D4AF37; --golddeep:#8C6D1F;
   --shadow:rgba(120,90,40,.13);
-  max-width:680px; margin:0 auto; padding:26px 20px 46px;
+  max-width:1180px; margin:26px auto; padding:40px 48px 48px;
+  border-radius:22px;
+  border:1px solid var(--line);
+  box-shadow:0 24px 70px rgba(120,90,40,.18), 0 2px 0 #fff inset;
   background:
-    radial-gradient(120% 60% at 50% -8%, #FFF8E9 0%, rgba(255,248,233,0) 60%),
+    radial-gradient(120% 50% at 50% -6%, #FFF8E9 0%, rgba(255,248,233,0) 55%),
+    radial-gradient(60% 40% at 100% 0%, #FBF1D8 0%, rgba(251,241,216,0) 60%),
     var(--ivory);
   color:var(--ink); font-family:"Hanken Grotesk",system-ui,sans-serif;
   -webkit-font-smoothing:antialiased; position:relative;
 }
+/* gilded inner hairline — the manuscript frame */
+.tr-root::before{
+  content:""; position:absolute; inset:13px; border-radius:15px; pointer-events:none;
+  border:1px solid var(--gold); opacity:.32;
+}
+.tr-root::after{
+  content:""; position:absolute; inset:13px; border-radius:15px; pointer-events:none;
+  box-shadow:0 0 0 4px rgba(255,255,255,.35) inset; opacity:.6;
+}
+.tr-root>*{position:relative;z-index:1;}
 .tr-root *{box-sizing:border-box;}
 .tr-root ::selection{background:#F0D67A88;}
 
@@ -553,6 +666,45 @@ const CSS = `
 
 .tr-panel{animation:fade .3s ease;}
 @keyframes fade{from{opacity:0;transform:translateY(5px);}to{opacity:1;transform:none;}}
+
+/* ---- two-column sprawl: timeline + consigliere rail ---- */
+.tr-layout{display:grid;grid-template-columns:minmax(0,1fr) 384px;gap:30px;align-items:start;}
+.tr-main{min-width:0;}
+.tr-side{position:sticky;top:24px;display:flex;flex-direction:column;gap:20px;min-width:0;}
+.tr-side .tr-consig,.tr-side .tr-eod{margin-top:0;}
+
+/* week / streak */
+.tr-stats{padding:16px 18px;border-radius:16px;background:linear-gradient(160deg,#FFFCF2,#F7EFD9);
+  border:1px solid var(--line);box-shadow:0 1px 3px var(--shadow);}
+.tr-statshead{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:13px;}
+.tr-statstitle{margin:0;font-family:"Fraunces",serif;font-style:italic;font-weight:600;font-size:17px;color:var(--ink);letter-spacing:-.01em;}
+.tr-streak{display:inline-flex;align-items:center;gap:5px;font-family:"Fraunces",serif;font-weight:600;
+  font-size:13px;color:var(--golddeep);background:#FFF6DF;border:1px solid var(--line);
+  padding:3px 10px;border-radius:999px;white-space:nowrap;}
+.tr-flame{color:var(--gold);font-size:13px;}
+.tr-week{display:flex;gap:8px;align-items:end;}
+.tr-wcol{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;background:transparent;
+  border:0;cursor:pointer;padding:0;}
+.tr-wtrack{width:100%;height:64px;border-radius:8px;background:#EFE3CB;
+  box-shadow:inset 0 1px 2px rgba(120,90,40,.12);display:flex;align-items:end;overflow:hidden;}
+.tr-wfill{width:100%;border-radius:8px;background:linear-gradient(180deg,var(--goldlite),var(--gold));
+  transition:height .5s cubic-bezier(.2,.8,.2,1);min-height:0;}
+.tr-wfill.full{background:linear-gradient(180deg,#3A8F63,#2E7D55);}
+.tr-wcol.view .tr-wtrack{box-shadow:inset 0 1px 2px rgba(120,90,40,.12),0 0 0 2px var(--gold);}
+.tr-wday{font-size:11px;font-weight:700;color:var(--faint);text-transform:uppercase;letter-spacing:.04em;}
+.tr-wday.on{color:var(--gold);}
+.tr-wcol:hover .tr-wtrack{box-shadow:inset 0 1px 2px rgba(120,90,40,.12),0 0 0 2px color-mix(in srgb,var(--gold) 50%,transparent);}
+
+/* settings: data backup */
+.tr-setdivider{display:flex;align-items:center;gap:10px;margin:14px 0 10px;
+  font-size:10.5px;font-weight:700;text-transform:uppercase;letter-spacing:.1em;color:var(--faint);}
+.tr-setdivider::before,.tr-setdivider::after{content:"";flex:1;height:1px;
+  background:linear-gradient(90deg,transparent,var(--line),transparent);}
+.tr-databtns{display:flex;gap:8px;margin:0 0 4px;}
+.tr-databtn{flex:1;padding:10px;border:1px solid var(--line);background:var(--ivory);color:var(--ink);
+  border-radius:9px;font-size:12.5px;font-weight:600;cursor:pointer;transition:.15s;font-family:inherit;}
+.tr-databtn:hover{border-color:var(--gold);background:#FFF8E4;}
+.tr-datamsg{margin:8px 0 4px;font-size:12px;color:var(--golddeep);font-style:italic;font-family:"Fraunces",serif;}
 
 /* date nav */
 .tr-daynav{display:flex;align-items:center;gap:10px;margin-bottom:16px;}
@@ -715,12 +867,36 @@ const CSS = `
 .tr-foot{margin-top:28px;font-family:"Fraunces",serif;font-style:italic;font-size:12px;
   color:var(--faint);text-align:center;line-height:1.6;}
 
+/* tabs: a centered jewel rather than a stretched bar */
+.tr-tabs{max-width:480px;margin-left:auto;margin-right:auto;}
+
+/* plan editor uses the width too — two columns on desktop */
+.tr-planlist{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px;}
+.tr-editrow{margin-bottom:0;}
+.tr-planhint,.tr-plantoggle{max-width:680px;}
+
+/* grandeur on wide screens */
+@media (min-width:1000px){
+  .tr-title{font-size:50px;}
+  .tr-sub{font-size:14px;}
+}
+
+/* collapse the sprawl back to one column */
+@media (max-width:900px){
+  .tr-root{max-width:680px;padding:30px 24px 44px;}
+  .tr-layout{grid-template-columns:1fr;gap:24px;}
+  .tr-side{position:static;}
+  .tr-planlist{grid-template-columns:1fr;}
+}
+
 @media (max-width:560px){
-  .tr-root{padding:20px 14px 38px;}
+  .tr-root{padding:20px 14px 38px;margin:10px auto;border-radius:16px;}
+  .tr-root::before,.tr-root::after{inset:8px;}
   .tr-title{font-size:34px;}
   .tr-emblem{flex-basis:54px;width:54px;height:54px;}
   .tr-icat{flex-basis:92px;}
   .tr-gear{width:34px;height:34px;}
+  .tr-databtns{flex-direction:column;}
 }
 @media (prefers-reduced-motion:reduce){
   .tr-emblem,.tr-armring,.tr-node,.tr-block,.tr-pbar span::after,.tr-live,.tr-tdot,.tr-title,.tr-panel,.tr-node.done::after{animation:none!important;}
