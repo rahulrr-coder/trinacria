@@ -190,7 +190,10 @@ export default function Trinacria() {
   const phase = hr < 5 ? "notte" : hr < 11 ? "alba" : hr < 17 ? "giorno" : hr < 21 ? "sera" : "notte";
   const appearance = themeMode === "notte" ? "dark" : themeMode === "light" ? "light" : (phase === "notte" ? "dark" : "light");
   const tintPhase = (appearance === "light" && phase === "notte") ? "sera" : phase;
-  useEffect(() => { document.body.style.background = appearance === "dark" ? "#0F0B06" : "#FAF3E4"; }, [appearance]);
+  useEffect(() => {
+    document.body.style.background = appearance === "dark" ? "#0F0B06" : "#FAF3E4";
+    document.querySelector('meta[name="theme-color"]')?.setAttribute("content", appearance === "dark" ? "#16110A" : "#FAF3E4");
+  }, [appearance]);
 
   const patchLog = (patch) => setLogs((prev) => { const cur = prev[dKey] || { done: {}, note: {}, reflection: "" }; return { ...prev, [dKey]: { ...cur, ...patch, updatedAt: Date.now() } }; });
   const toggleDone = (id) => patchLog({ done: { ...log.done, [id]: !log.done[id] } });
@@ -285,6 +288,26 @@ export default function Trinacria() {
     : gh.gistId ? (gh.lastSync ? `synced ${new Date(gh.lastSync).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "connected")
     : "not connected";
 
+  /* ---- reminders: nudge when a block becomes "now" (app open) ---- */
+  const notify = !!aiCfg.notify;
+  const toggleNotify = async (on) => {
+    if (on && typeof Notification !== "undefined" && Notification.permission !== "granted") {
+      const res = await Notification.requestPermission().catch(() => "denied");
+      if (res !== "granted") { setDataMsg("Browser blocked notifications — enable them for this site."); return; }
+    }
+    setAiCfg((p) => ({ ...p, notify: on }));
+  };
+  const prevNowRef = useRef(null);
+  useEffect(() => {
+    if (!loaded) return;
+    const prev = prevNowRef.current;
+    prevNowRef.current = currentId;
+    if (!notify || !onToday || !currentId || currentId === prev) return;
+    if (typeof Notification === "undefined" || Notification.permission !== "granted") return;
+    const b = tpl.find((x) => x.id === currentId);
+    if (b) { try { new Notification("Trinacria · ora", { body: `${b.time} — ${b.label}`, tag: "trinacria-now" }); } catch { /* ignore */ } }
+  }, [currentId, loaded, notify, onToday, tpl]);
+
   /* ---- AI plumbing ---- */
   const buildContext = () => {
     const lines = tpl.map((b) => {
@@ -372,6 +395,10 @@ export default function Trinacria() {
             </div>
           </div>
           <p className="tr-setnote">Auto follows your device clock — saffron at dawn, cobalt by day, candle-lit at night.</p>
+          <label className="tr-remember">
+            <input type="checkbox" checked={notify} onChange={(e) => toggleNotify(e.target.checked)} />
+            <span>Nudge me when a block begins (while open)</span>
+          </label>
           <div className="tr-setdivider"><span>Consigliere · AI</span></div>
           <div className="tr-setrow">
             <span className="tr-setlabel">Provider</span>
