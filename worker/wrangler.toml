@@ -1,0 +1,13 @@
+name = "trinacria-proxy"
+main = "index.js"
+compatibility_date = "2024-11-01"
+
+# Public, non-secret config. Lock the proxy to the origins that may call it.
+[vars]
+ALLOWED_ORIGINS = "https://rahulrr-coder.github.io,http://localhost:5173"
+
+# Secrets are NOT set here — never commit them. Set each with:
+#   wrangler secret put GH_TOKEN        # GitHub PAT, gist scope only
+#   wrangler secret put GROQ_KEY        # Groq API key
+#   wrangler secret put SAMBANOVA_KEY   # optional
+#   wrangler secret put APP_SECRET      # optional shared secret (X-App-Secret)

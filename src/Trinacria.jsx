@@ -1,6 +1,13 @@
 import { useState, useEffect, useRef } from "react";
 import { createGist, pullGist, pushGist, mergeState } from "./sync.js";
 
+/* Optional secure proxy (a Cloudflare Worker holding the real secrets).
+ * When VITE_PROXY_URL is set at build time, AI + sync route through it and
+ * no token/key ever lives in the browser. Unset → direct calls (default). */
+const PROXY = (import.meta.env?.VITE_PROXY_URL || "").replace(/\/$/, "");
+const PROXY_SECRET = import.meta.env?.VITE_PROXY_SECRET || "";
+const useProxy = !!PROXY;
+
 /* ============================================================ *
  *  TRINACRIA — your day in three movements.
  *  IITM (morning) · Maersk (day) · DeckView (night).
@@ -122,12 +129,17 @@ const PROVIDERS = {
   },
 };
 async function askAI({ provider, apiKey, model, system, user }) {
-  const p = PROVIDERS[provider];
-  const res = await fetch(p.url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
-    body: JSON.stringify({ model, messages: [{ role: "system", content: system }, { role: "user", content: user }], temperature: 0.6, max_tokens: 800 }),
-  });
+  const res = useProxy
+    ? await fetch(`${PROXY}/api/ai`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...(PROXY_SECRET ? { "X-App-Secret": PROXY_SECRET } : {}) },
+        body: JSON.stringify({ provider, model, system, user }),
+      })
+    : await fetch(PROVIDERS[provider].url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, messages: [{ role: "system", content: system }, { role: "user", content: user }], temperature: 0.6, max_tokens: 800 }),
+      });
   if (!res.ok) { const t = await res.text().catch(() => ""); throw new Error(`${res.status} · ${t.slice(0, 140) || res.statusText}`); }
   const data = await res.json();
   return data.choices?.[0]?.message?.content?.trim() || "(no reply)";
@@ -266,17 +278,19 @@ export default function Trinacria() {
     r.readAsText(file);
   };
 
-  /* ---- multi-device sync via a private GitHub gist ---- */
+  /* ---- multi-device sync (proxy or direct gist) ---- */
+  const connOf = (token) => ({ token, proxy: PROXY, secret: PROXY_SECRET });
+  const canSync = (token, gistId) => !!gistId && (useProxy || !!token);
   const syncNow = async () => {
     const { token, gistId } = gh;
-    if (!token || !gistId) return;
+    if (!canSync(token, gistId)) return;
     setSyncState("syncing"); setSyncErr("");
     try {
-      const remote = await pullGist(token, gistId);
+      const remote = await pullGist(connOf(token), gistId);
       const merged = mergeState(snapshotOf(stateRef.current), remote);
       setTemplates(merged.templates);
       setLogs(merged.logs);
-      await pushGist(token, gistId, merged);
+      await pushGist(connOf(token), gistId, merged);
       setGh((p) => ({ ...p, lastSync: Date.now() }));
       setSyncState("synced");
     } catch (e) { setSyncErr(String(e.message || e)); setSyncState("error"); }
@@ -287,12 +301,12 @@ export default function Trinacria() {
 
   const connectGist = async () => {
     const token = ghToken.trim();
-    if (!token) { setSyncErr("Paste a token first."); setSyncState("error"); return; }
+    if (!useProxy && !token) { setSyncErr("Paste a token first."); setSyncState("error"); return; }
     setSyncState("syncing"); setSyncErr("");
     try {
       let gistId = gh.gistId;
-      if (!gistId) gistId = await createGist(token, snapshotOf(stateRef.current));
-      setGh({ token, gistId, lastSync: Date.now() });
+      if (!gistId) gistId = await createGist(connOf(token), snapshotOf(stateRef.current));
+      setGh({ token: useProxy ? "" : token, gistId, lastSync: Date.now() });
       setSyncState("synced");
     } catch (e) { setSyncErr(String(e.message || e)); setSyncState("error"); }
   };
@@ -303,11 +317,11 @@ export default function Trinacria() {
 
   // pull + merge once we're connected (covers boot and the moment of connecting)
   useEffect(() => {
-    if (loaded && gh.token && gh.gistId) syncRef.current();
+    if (loaded && canSync(gh.token, gh.gistId)) syncRef.current();
   }, [loaded, gh.token, gh.gistId]);
   // debounced push whenever data changes while connected
   useEffect(() => {
-    if (!loaded || !gh.token || !gh.gistId) return;
+    if (!loaded || !canSync(gh.token, gh.gistId)) return;
     const id = setTimeout(() => syncRef.current(), 4000);
     return () => clearTimeout(id);
   }, [templates, logs, loaded, gh.token, gh.gistId]);
@@ -348,7 +362,7 @@ export default function Trinacria() {
   const SYSTEM = "You are Il Consigliere, Rahul's trusted advisor inside his daily planner. His model: a sliding window of three streams in fixed order — IITM (study, morning), Maersk (work, day), DeckView (his SaaS, night) — with intensity that flexes. DSA is one problem a day inside Maersk dead-time. Be direct, warm, brief. No flattery, no hedging. Use short clear sections with bold subheadings only when it genuinely helps. Push back when his plan is unrealistic. Keep it under ~180 words unless asked for more.";
 
   const runAI = async (userMsg) => {
-    if (!apiKey.trim()) { setSettingsOpen(true); setAiErr("Add a key to wake your consigliere."); return; }
+    if (!useProxy && !apiKey.trim()) { setSettingsOpen(true); setAiErr("Add a key to wake your consigliere."); return; }
     setAiBusy(true); setAiErr(""); setAiOut("");
     try {
       const out = await askAI({ provider: aiCfg.provider, apiKey: apiKey.trim(), model: aiCfg.model, system: SYSTEM, user: `${userMsg}\n\n---\n${buildContext()}` });
@@ -367,7 +381,7 @@ export default function Trinacria() {
    * author today's if a key is connected. Stored on the day so it syncs. ---- */
   const carta = log.carta || cartaOf(dKey);
   const drawCarta = async () => {
-    if (!apiKey.trim() || cartaBusy) return;
+    if ((!useProxy && !apiKey.trim()) || cartaBusy) return;
     setCartaBusy(true);
     try {
       const out = await askAI({
@@ -473,26 +487,38 @@ export default function Trinacria() {
                     {PROVIDERS[aiCfg.provider].models.map((m) => <option key={m} value={m}>{m}</option>)}
                   </select>
                 </div>
-                <div className="tr-setrow">
-                  <span className="tr-setlabel">API key</span>
-                  <input className="tr-keyinput" type="password" value={apiKey} placeholder={PROVIDERS[aiCfg.provider].keyHint}
-                    onChange={(e) => setApiKey(e.target.value)} />
-                </div>
-                <label className="tr-remember">
-                  <input type="checkbox" checked={aiCfg.remember} onChange={(e) => saveKeyToggle(e.target.checked)} />
-                  <span>Save key on this device</span>
-                </label>
-                <p className="tr-setnote">Stored only here, for you. Get a key at <b>{PROVIDERS[aiCfg.provider].console}</b>.</p>
+                {useProxy ? (
+                  <p className="tr-setnote">🔒 Keys are held by your secure proxy — nothing to enter here.</p>
+                ) : (
+                  <>
+                    <div className="tr-setrow">
+                      <span className="tr-setlabel">API key</span>
+                      <input className="tr-keyinput" type="password" value={apiKey} placeholder={PROVIDERS[aiCfg.provider].keyHint}
+                        onChange={(e) => setApiKey(e.target.value)} />
+                    </div>
+                    <label className="tr-remember">
+                      <input type="checkbox" checked={aiCfg.remember} onChange={(e) => saveKeyToggle(e.target.checked)} />
+                      <span>Save key on this device</span>
+                    </label>
+                    <p className="tr-setnote">Stored only here, for you. Get a key at <b>{PROVIDERS[aiCfg.provider].console}</b>.</p>
+                  </>
+                )}
               </section>
 
               <section className="tr-section">
                 <h3 className="tr-sectitle">Sync · across devices</h3>
-                <p className="tr-setnote">Keep your day in step on phone and laptop through a <b>private GitHub gist</b>. Use a token with <b>only the gist scope</b>.</p>
-                <div className="tr-setrow">
-                  <span className="tr-setlabel">Token</span>
-                  <input className="tr-keyinput" type="password" value={ghToken} placeholder="github_pat_… / ghp_…"
-                    onChange={(e) => setGhToken(e.target.value)} />
-                </div>
+                {useProxy ? (
+                  <p className="tr-setnote">🔒 Synced through your secure proxy — no token needed. Just turn it on.</p>
+                ) : (
+                  <>
+                    <p className="tr-setnote">Keep your day in step on phone and laptop through a <b>private GitHub gist</b>. Use a token with <b>only the gist scope</b>.</p>
+                    <div className="tr-setrow">
+                      <span className="tr-setlabel">Token</span>
+                      <input className="tr-keyinput" type="password" value={ghToken} placeholder="github_pat_… / ghp_…"
+                        onChange={(e) => setGhToken(e.target.value)} />
+                    </div>
+                  </>
+                )}
                 {gh.gistId ? (
                   <div className="tr-syncrow">
                     <span className={`tr-syncstat is-${syncState}`}><i className="tr-syncdot" />{syncLabel}</span>
@@ -501,11 +527,11 @@ export default function Trinacria() {
                   </div>
                 ) : (
                   <button className="tr-connect" onClick={connectGist} disabled={syncState === "syncing"}>
-                    {syncState === "syncing" ? "Connecting…" : "Connect & sync"}
+                    {syncState === "syncing" ? "Connecting…" : useProxy ? "Turn on sync" : "Connect & sync"}
                   </button>
                 )}
                 {syncErr && <p className="tr-datamsg tr-syncerr">{syncErr}</p>}
-                {gh.gistId && <p className="tr-setnote">Linked gist <b>{gh.gistId.slice(0, 8)}…</b> · token stays only in this browser.</p>}
+                {gh.gistId && <p className="tr-setnote">Linked gist <b>{gh.gistId.slice(0, 8)}…</b>{useProxy ? " · via your proxy." : " · token stays only in this browser."}</p>}
               </section>
 
               <section className="tr-section">
@@ -613,7 +639,7 @@ export default function Trinacria() {
             </div>
             <p className="tr-cartait">{carta.it}</p>
             {carta.en && <p className="tr-cartaen">{carta.en}</p>}
-            {apiKey && (
+            {(apiKey || useProxy) && (
               <button className="tr-cartadraw" onClick={drawCarta} disabled={cartaBusy}>
                 {cartaBusy ? "il consigliere scrive…" : "✦ let il consigliere write today’s"}
               </button>
@@ -674,7 +700,7 @@ export default function Trinacria() {
             {aiBusy && <p className="tr-thinking"><i className="tr-tdot" /> il consigliere riflette…</p>}
             {aiErr && <p className="tr-aierr">{aiErr}</p>}
             {aiOut && !aiBusy && <div className="tr-aiout">{aiOut}</div>}
-            {!apiKey && !aiBusy && !aiOut && !aiErr && (
+            {!apiKey && !useProxy && !aiBusy && !aiOut && !aiErr && (
               <p className="tr-aihint">Connect <b>Groq</b> or <b>SambaNova</b> (the ✦ up top) to wake him.</p>
             )}
           </div>
