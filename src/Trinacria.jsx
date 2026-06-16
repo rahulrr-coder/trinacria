@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { createGist, pullGist, pushGist, mergeState } from "./sync.js";
 
 /* ============================================================ *
  *  TRINACRIA — your day in three movements.
@@ -73,6 +74,15 @@ const K_T = "trinacria_templates_v1";
 const K_L = "trinacria_logs_v1";
 const K_AI = "trinacria_ai_v1";
 const K_KEY = "trinacria_aikey_v1";
+const K_GH = "trinacria_gh_v1";
+
+/* a single portable snapshot of everything worth keeping — used by
+ * both file export/import and gist sync, so they never drift apart. */
+const snapshotOf = (s) => ({
+  app: "trinacria", version: 1, exportedAt: new Date().toISOString(),
+  templates: s.templates, logs: s.logs,
+  aiCfg: { provider: s.aiCfg?.provider, model: s.aiCfg?.model },
+});
 async function sGet(k) { try { const r = localStorage.getItem(k); return r ? JSON.parse(r) : null; } catch { return null; } }
 async function sSet(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { /* storage full or unavailable */ return false; } }
 async function sDel(k) { try { localStorage.removeItem(k); } catch { /* storage unavailable */ return false; } }
@@ -114,7 +124,7 @@ export default function Trinacria() {
   const [openNote, setOpenNote] = useState(null);
 
   // AI state
-  const [aiCfg, setAiCfg] = useState({ provider: "groq", model: PROVIDERS.groq.models[0], remember: false });
+  const [aiCfg, setAiCfg] = useState({ provider: "groq", model: PROVIDERS.groq.models[0], remember: false, theme: "auto" });
   const [apiKey, setApiKey] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [aiInput, setAiInput] = useState("");
@@ -124,15 +134,25 @@ export default function Trinacria() {
   const [dataMsg, setDataMsg] = useState("");
   const importRef = useRef(null);
 
+  // Sync (GitHub Gist) state
+  const [gh, setGh] = useState({ token: "", gistId: "", lastSync: 0 });
+  const [ghToken, setGhToken] = useState("");            // controlled input before connecting
+  const [syncState, setSyncState] = useState("idle");    // idle | syncing | synced | error
+  const [syncErr, setSyncErr] = useState("");
+  // always-current snapshot, so debounced/async sync never reads stale state
+  const stateRef = useRef({ templates, logs, aiCfg });
+  useEffect(() => { stateRef.current = { templates, logs, aiCfg }; }, [templates, logs, aiCfg]);
+
   useEffect(() => {
     let alive = true;
     (async () => {
-      const [t, l, a, k] = await Promise.all([sGet(K_T), sGet(K_L), sGet(K_AI), sGet(K_KEY)]);
+      const [t, l, a, k, g] = await Promise.all([sGet(K_T), sGet(K_L), sGet(K_AI), sGet(K_KEY), sGet(K_GH)]);
       if (!alive) return;
       if (t?.weekday && t?.weekend) setTemplates(t);
       if (l) setLogs(l);
       if (a) setAiCfg((p) => ({ ...p, ...a }));
       if (a?.remember && k?.key) setApiKey(k.key);
+      if (g?.token && g?.gistId) { setGh(g); setGhToken(g.token); }
       setLoaded(true);
     })();
     return () => { alive = false; };
@@ -142,6 +162,7 @@ export default function Trinacria() {
   useEffect(() => { if (loaded) sSet(K_AI, aiCfg); }, [aiCfg, loaded]);
   useEffect(() => { const id = setInterval(() => setNow(new Date()), 60000); return () => clearInterval(id); }, []);
   useEffect(() => { if (loaded && aiCfg.remember && apiKey.trim()) sSet(K_KEY, { key: apiKey.trim() }); }, [apiKey, aiCfg.remember, loaded]);
+  useEffect(() => { if (loaded) sSet(K_GH, gh); }, [gh, loaded]);
 
   const weekendView = isWeekend(viewDate);
   const tpl = weekendView ? templates.weekend : templates.weekday;
@@ -158,12 +179,25 @@ export default function Trinacria() {
   const doneCount = tpl.filter((b) => log.done[b.id]).length;
   const pct = tpl.length ? Math.round((doneCount / tpl.length) * 100) : 0;
 
-  const patchLog = (patch) => setLogs((prev) => { const cur = prev[dKey] || { done: {}, note: {}, reflection: "" }; return { ...prev, [dKey]: { ...cur, ...patch } }; });
+  // per-stream completion for the triskele dial (this viewed day)
+  const streamProg = { IITM: [0, 0], Maersk: [0, 0], DeckView: [0, 0] };
+  tpl.forEach((b) => { const s = STREAM_OF[b.cat]; if (s && streamProg[s]) { streamProg[s][1]++; if (log.done[b.id]) streamProg[s][0]++; } });
+  const streamPct = Object.fromEntries(Object.entries(streamProg).map(([k, [d, t]]) => [k, t ? d / t : 0]));
+
+  // time-of-day theming: phase from the device clock, with a manual override
+  const themeMode = aiCfg.theme || "auto"; // auto | light | notte
+  const hr = now.getHours();
+  const phase = hr < 5 ? "notte" : hr < 11 ? "alba" : hr < 17 ? "giorno" : hr < 21 ? "sera" : "notte";
+  const appearance = themeMode === "notte" ? "dark" : themeMode === "light" ? "light" : (phase === "notte" ? "dark" : "light");
+  const tintPhase = (appearance === "light" && phase === "notte") ? "sera" : phase;
+  useEffect(() => { document.body.style.background = appearance === "dark" ? "#0F0B06" : "#FAF3E4"; }, [appearance]);
+
+  const patchLog = (patch) => setLogs((prev) => { const cur = prev[dKey] || { done: {}, note: {}, reflection: "" }; return { ...prev, [dKey]: { ...cur, ...patch, updatedAt: Date.now() } }; });
   const toggleDone = (id) => patchLog({ done: { ...log.done, [id]: !log.done[id] } });
   const setNote = (id, v) => patchLog({ note: { ...log.note, [id]: v } });
   const setReflection = (v) => patchLog({ reflection: v });
 
-  const setList = (w, list) => setTemplates((p) => ({ ...p, [w]: list }));
+  const setList = (w, list) => setTemplates((p) => ({ ...p, [w]: list, [`${w}UpdatedAt`]: Date.now() }));
   const editBlock = (w, id, patch) => setList(w, templates[w].map((b) => (b.id === id ? { ...b, ...patch } : b)));
   const removeBlock = (w, id) => setList(w, templates[w].filter((b) => b.id !== id));
   const addBlock = (w) => setList(w, [...templates[w], { id: uid(), time: "anytime", label: "New block", cat: "custom", note: "" }]);
@@ -179,11 +213,7 @@ export default function Trinacria() {
 
   /* ---- backup: export / import ---- */
   const exportData = () => {
-    const payload = {
-      app: "trinacria", version: 1, exportedAt: new Date().toISOString(),
-      templates, logs, aiCfg: { provider: aiCfg.provider, model: aiCfg.model },
-    };
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const blob = new Blob([JSON.stringify(snapshotOf({ templates, logs, aiCfg }), null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url; a.download = `trinacria-backup-${keyOf(new Date())}.json`;
@@ -204,6 +234,56 @@ export default function Trinacria() {
     };
     r.readAsText(file);
   };
+
+  /* ---- multi-device sync via a private GitHub gist ---- */
+  const syncNow = async () => {
+    const { token, gistId } = gh;
+    if (!token || !gistId) return;
+    setSyncState("syncing"); setSyncErr("");
+    try {
+      const remote = await pullGist(token, gistId);
+      const merged = mergeState(snapshotOf(stateRef.current), remote);
+      setTemplates(merged.templates);
+      setLogs(merged.logs);
+      await pushGist(token, gistId, merged);
+      setGh((p) => ({ ...p, lastSync: Date.now() }));
+      setSyncState("synced");
+    } catch (e) { setSyncErr(String(e.message || e)); setSyncState("error"); }
+  };
+  // keep a stable handle so the debounce effect needn't depend on syncNow
+  const syncRef = useRef(syncNow);
+  useEffect(() => { syncRef.current = syncNow; });
+
+  const connectGist = async () => {
+    const token = ghToken.trim();
+    if (!token) { setSyncErr("Paste a token first."); setSyncState("error"); return; }
+    setSyncState("syncing"); setSyncErr("");
+    try {
+      let gistId = gh.gistId;
+      if (!gistId) gistId = await createGist(token, snapshotOf(stateRef.current));
+      setGh({ token, gistId, lastSync: Date.now() });
+      setSyncState("synced");
+    } catch (e) { setSyncErr(String(e.message || e)); setSyncState("error"); }
+  };
+  const disconnectGist = () => {
+    setGh({ token: "", gistId: "", lastSync: 0 });
+    setGhToken(""); setSyncState("idle"); setSyncErr("");
+  };
+
+  // pull + merge once we're connected (covers boot and the moment of connecting)
+  useEffect(() => {
+    if (loaded && gh.token && gh.gistId) syncRef.current();
+  }, [loaded, gh.token, gh.gistId]);
+  // debounced push whenever data changes while connected
+  useEffect(() => {
+    if (!loaded || !gh.token || !gh.gistId) return;
+    const id = setTimeout(() => syncRef.current(), 4000);
+    return () => clearTimeout(id);
+  }, [templates, logs, loaded, gh.token, gh.gistId]);
+  const syncLabel = syncState === "syncing" ? "syncing…"
+    : syncState === "error" ? "sync error"
+    : gh.gistId ? (gh.lastSync ? `synced ${new Date(gh.lastSync).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "connected")
+    : "not connected";
 
   /* ---- AI plumbing ---- */
   const buildContext = () => {
@@ -232,19 +312,28 @@ export default function Trinacria() {
     if (!remember) await sDel(K_KEY);
   };
 
+  const THEME_CYCLE = { auto: "light", light: "notte", notte: "auto" };
+  const THEME_ICON = { auto: "◐", light: "☀", notte: "☾" };
+  const THEME_NAME = { auto: "Auto — follows the day", light: "Light", notte: "Notte (dark)" };
+
   return (
-    <div className="tr-root">
+    <div className="tr-root" data-phase={tintPhase} data-appearance={appearance}>
       <style>{CSS}</style>
+      <div className="tr-aura" aria-hidden="true" />
 
       {/* ---------------- HEADER ---------------- */}
       <header className="tr-head">
-        <Emblem activeStream={weekendView ? null : activeStream} />
+        <Emblem activeStream={weekendView ? null : activeStream} progress={streamPct} />
         <div className="tr-headtext">
           <p className="tr-eyebrow">La giornata in tre movimenti</p>
           <h1 className="tr-title">Trinacria</h1>
           <p className="tr-sub">Your day in three movements — study, work, the thing you’re building. The order holds; the intensity bends.</p>
         </div>
-        <button className="tr-gear" onClick={() => setSettingsOpen((v) => !v)} aria-label="AI settings" title="Consigliere settings">✦</button>
+        <div className="tr-headbtns">
+          <button className="tr-theme" onClick={() => setAiCfg((p) => ({ ...p, theme: THEME_CYCLE[themeMode] }))}
+            aria-label="Cycle appearance" title={`Appearance: ${THEME_NAME[themeMode]}`}>{THEME_ICON[themeMode]}</button>
+          <button className="tr-gear" onClick={() => setSettingsOpen((v) => !v)} aria-label="AI settings" title="Consigliere settings">✦</button>
+        </div>
       </header>
 
       {/* stream ribbon */}
@@ -273,6 +362,17 @@ export default function Trinacria() {
       {/* ---------------- SETTINGS DRAWER ---------------- */}
       {settingsOpen && (
         <div className="tr-settings">
+          <div className="tr-setrow">
+            <span className="tr-setlabel">Theme</span>
+            <div className="tr-provsel">
+              {["auto", "light", "notte"].map((m) => (
+                <button key={m} className={`tr-prov ${themeMode === m ? "on" : ""}`}
+                  onClick={() => setAiCfg((p) => ({ ...p, theme: m }))}>{m[0].toUpperCase() + m.slice(1)}</button>
+              ))}
+            </div>
+          </div>
+          <p className="tr-setnote">Auto follows your device clock — saffron at dawn, cobalt by day, candle-lit at night.</p>
+          <div className="tr-setdivider"><span>Consigliere · AI</span></div>
           <div className="tr-setrow">
             <span className="tr-setlabel">Provider</span>
             <div className="tr-provsel">
@@ -308,6 +408,27 @@ export default function Trinacria() {
               onChange={(e) => { importData(e.target.files?.[0]); e.target.value = ""; }} />
           </div>
           {dataMsg && <p className="tr-datamsg">{dataMsg}</p>}
+
+          <div className="tr-setdivider"><span>Sync · across devices</span></div>
+          <p className="tr-setnote">Keep your day in step on phone and laptop through a <b>private GitHub gist</b>. Create a token with <b>only the gist scope</b> at <b>github.com/settings/tokens</b>.</p>
+          <div className="tr-setrow">
+            <span className="tr-setlabel">Token</span>
+            <input className="tr-keyinput" type="password" value={ghToken} placeholder="github_pat_… / ghp_…"
+              onChange={(e) => setGhToken(e.target.value)} />
+          </div>
+          {gh.gistId ? (
+            <div className="tr-syncrow">
+              <span className={`tr-syncstat is-${syncState}`}><i className="tr-syncdot" />{syncLabel}</span>
+              <button className="tr-databtn" onClick={syncNow} disabled={syncState === "syncing"}>Sync now</button>
+              <button className="tr-databtn" onClick={disconnectGist}>Disconnect</button>
+            </div>
+          ) : (
+            <button className="tr-connect" onClick={connectGist} disabled={syncState === "syncing"}>
+              {syncState === "syncing" ? "Connecting…" : "Connect & sync"}
+            </button>
+          )}
+          {syncErr && <p className="tr-datamsg tr-syncerr">{syncErr}</p>}
+          {gh.gistId && <p className="tr-setnote">Linked gist <b>{gh.gistId.slice(0, 8)}…</b> · token stays only in this browser. Use a dedicated gist-only token; don’t connect on a shared machine.</p>}
 
           <button className="tr-setdone" onClick={() => { setSettingsOpen(false); setDataMsg(""); }}>Done</button>
         </div>
@@ -486,7 +607,7 @@ export default function Trinacria() {
 }
 
 /* ---------------- Gilded triskele emblem ---------------- */
-function Emblem({ activeStream }) {
+function Emblem({ activeStream, progress = {} }) {
   const arms = [
     { ang: 90, stream: "IITM", c: CATS.iitm.color },
     { ang: 330, stream: "Maersk", c: CATS.maersk.color },
@@ -513,10 +634,16 @@ function Emblem({ activeStream }) {
       {arms.map((arm) => {
         const p = path(arm.ang);
         const live = activeStream === arm.stream;
+        const prog = Math.max(0, Math.min(1, progress[arm.stream] || 0));
         return (
           <g key={arm.stream} className={live ? "tr-armlive" : ""} style={live ? { color: arm.c } : undefined}>
-            <path d={p.d} fill="none" stroke="url(#gold)" strokeWidth="3.4" strokeLinecap="round" />
-            <circle cx={p.ex} cy={p.ey} r={live ? 7.5 : 6} fill={arm.c} stroke="url(#gold)" strokeWidth="1.6" />
+            {/* faint gold base — the unlit arm */}
+            <path d={p.d} fill="none" stroke="url(#gold)" strokeWidth="3.4" strokeLinecap="round" opacity="0.45" />
+            {/* coloured overlay reveals as that stream's blocks get done */}
+            <path d={p.d} fill="none" stroke={arm.c} strokeWidth="3.4" strokeLinecap="round"
+              pathLength="1" style={{ strokeDasharray: 1, strokeDashoffset: 1 - prog, transition: "stroke-dashoffset .6s ease" }} />
+            <circle cx={p.ex} cy={p.ey} r={live ? 7.5 : 6} fill={arm.c} fillOpacity={0.3 + 0.7 * prog}
+              stroke="url(#gold)" strokeWidth="1.6" />
             {live && <circle cx={p.ex} cy={p.ey} r="6" fill="none" stroke={arm.c} strokeWidth="1.4" className="tr-armring" />}
           </g>
         );
@@ -596,6 +723,46 @@ const CSS = `
 .tr-root *{box-sizing:border-box;}
 .tr-root ::selection{background:#F0D67A88;}
 
+/* ---- time-of-day phases: an --accent per phase + a morning aura ---- */
+.tr-root{--accent:#C9A227;transition:background 1.2s ease,border-color .6s ease;}
+.tr-root[data-phase="alba"]{--accent:#E0A500;}
+.tr-root[data-phase="giorno"]{--accent:#1F5FA6;}
+.tr-root[data-phase="sera"]{--accent:#B85C38;}
+.tr-root[data-phase="notte"]{--accent:#D4AF37;}
+.tr-aura{position:absolute;inset:0;border-radius:inherit;pointer-events:none;z-index:0;opacity:0;
+  background:radial-gradient(58% 38% at 50% 0%, var(--accent), transparent 70%);
+  transition:opacity 1.2s ease;}
+.tr-root[data-phase="alba"] .tr-aura{opacity:.16;animation:aura 7s ease-in-out infinite;}
+.tr-root[data-phase="giorno"] .tr-aura{opacity:.07;}
+.tr-root[data-phase="sera"] .tr-aura{opacity:.12;}
+.tr-root[data-phase="notte"] .tr-aura{opacity:.10;}
+@keyframes aura{0%,100%{opacity:.12;}50%{opacity:.22;}}
+
+/* ---- Notte: a candle-lit dark theme (manual, or auto at night) ---- */
+.tr-root[data-appearance="dark"]{
+  --ivory:#16110A; --cream:#201A11; --ink:#F2E7CF; --soft:#C9B68E; --faint:#917F60;
+  --border:#322817; --line:#3E3220; --shadow:rgba(0,0,0,.55);
+  border-color:#3E3220; box-shadow:0 24px 70px rgba(0,0,0,.5);
+  background:
+    radial-gradient(120% 50% at 50% -6%, #2A2113 0%, rgba(42,33,19,0) 55%),
+    radial-gradient(60% 40% at 100% 0%, #241C10 0%, rgba(36,28,16,0) 60%),
+    #16110A;
+}
+.tr-root[data-appearance="dark"]::after{box-shadow:0 0 0 4px rgba(0,0,0,.22) inset;}
+.tr-root[data-appearance="dark"] .tr-title{background:linear-gradient(180deg,#F0D67A,#C9A227);
+  -webkit-background-clip:text;background-clip:text;}
+.tr-root[data-appearance="dark"] .tr-tile{background:var(--cream);}
+.tr-root[data-appearance="dark"] .tr-ribbon{background:linear-gradient(180deg,#241C10,#1B1408);}
+.tr-root[data-appearance="dark"] .tr-rpill.on{background:#2A2012;}
+.tr-root[data-appearance="dark"] .tr-tabs,
+.tr-root[data-appearance="dark"] .tr-plantoggle{background:#1B1408;}
+.tr-root[data-appearance="dark"] .tr-pbar,
+.tr-root[data-appearance="dark"] .tr-wtrack{background:#2A2113;}
+.tr-root[data-appearance="dark"] .tr-donenote,
+.tr-root[data-appearance="dark"] .tr-streak{background:#2A2012;}
+.tr-root[data-appearance="dark"] .tr-stats,
+.tr-root[data-appearance="dark"] .tr-consig{background:linear-gradient(160deg,#241C10,#1E1710);}
+
 /* header */
 .tr-head{display:flex;align-items:flex-start;gap:16px;margin-bottom:18px;position:relative;}
 .tr-emblem{flex:0 0 64px;filter:drop-shadow(0 2px 5px var(--shadow));animation:embin 1s cubic-bezier(.2,.8,.2,1) both;}
@@ -612,10 +779,15 @@ const CSS = `
   animation:rise .8s ease .1s both;}
 @keyframes rise{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:none;}}
 .tr-sub{margin:7px 0 0;font-size:13px;line-height:1.5;color:var(--soft);max-width:46ch;}
-.tr-gear{position:absolute;top:0;right:0;width:38px;height:38px;border-radius:50%;
+.tr-headbtns{display:flex;gap:8px;flex:0 0 auto;align-items:center;}
+.tr-gear,.tr-theme{width:38px;height:38px;border-radius:50%;
   border:1px solid var(--line);background:var(--cream);color:var(--gold);font-size:16px;
-  cursor:pointer;transition:.2s;box-shadow:0 1px 3px var(--shadow);}
+  cursor:pointer;transition:.2s;box-shadow:0 1px 3px var(--shadow);display:flex;align-items:center;justify-content:center;}
 .tr-gear:hover{transform:rotate(90deg);border-color:var(--gold);background:#FFF8E4;}
+.tr-theme{font-size:17px;}
+.tr-theme:hover{border-color:var(--gold);background:#FFF8E4;transform:scale(1.08);}
+.tr-root[data-appearance="dark"] .tr-gear:hover,
+.tr-root[data-appearance="dark"] .tr-theme:hover{background:#2A2012;}
 
 /* ribbon */
 .tr-ribbon{display:flex;flex-wrap:wrap;align-items:center;gap:7px;margin-bottom:20px;
@@ -705,6 +877,17 @@ const CSS = `
   border-radius:9px;font-size:12.5px;font-weight:600;cursor:pointer;transition:.15s;font-family:inherit;}
 .tr-databtn:hover{border-color:var(--gold);background:#FFF8E4;}
 .tr-datamsg{margin:8px 0 4px;font-size:12px;color:var(--golddeep);font-style:italic;font-family:"Fraunces",serif;}
+.tr-syncrow{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:4px 0;}
+.tr-syncstat{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;font-weight:600;color:var(--soft);margin-right:auto;}
+.tr-syncdot{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:0 0 8px;}
+.tr-syncstat.is-syncing .tr-syncdot{background:var(--gold);animation:tdot 1s infinite;}
+.tr-syncstat.is-synced .tr-syncdot{background:#2E7D55;}
+.tr-syncstat.is-error .tr-syncdot{background:#C8472B;}
+.tr-connect{width:100%;padding:11px;border:0;border-radius:9px;background:var(--gold);color:#fff;
+  font-size:13px;font-weight:700;cursor:pointer;transition:.15s;font-family:inherit;}
+.tr-connect:hover:not(:disabled){background:var(--golddeep);}
+.tr-connect:disabled{opacity:.5;cursor:default;}
+.tr-syncerr{color:#A53B27;font-style:normal;}
 
 /* date nav */
 .tr-daynav{display:flex;align-items:center;gap:10px;margin-bottom:16px;}
@@ -899,7 +1082,7 @@ const CSS = `
   .tr-databtns{flex-direction:column;}
 }
 @media (prefers-reduced-motion:reduce){
-  .tr-emblem,.tr-armring,.tr-node,.tr-block,.tr-pbar span::after,.tr-live,.tr-tdot,.tr-title,.tr-panel,.tr-node.done::after{animation:none!important;}
+  .tr-emblem,.tr-armring,.tr-node,.tr-block,.tr-pbar span::after,.tr-live,.tr-tdot,.tr-title,.tr-panel,.tr-node.done::after,.tr-aura{animation:none!important;}
   .tr-tile{transition:none;}
 }
 `;
