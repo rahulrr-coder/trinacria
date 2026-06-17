@@ -314,6 +314,23 @@
 .tr-donenote{margin:8px 0 0;font-size:12.5px;color:var(--ink);background:#FFF6DF;
   border-left:2px solid var(--gold);border-radius:0 7px 7px 0;padding:8px 11px;line-height:1.5;}
 
+/* collapsed "what you did" — a quiet one-line chip, click to expand */
+.tr-donechip{margin-top:9px;display:flex;align-items:center;gap:8px;width:100%;max-width:100%;
+  background:#FFF6DF;border:1px solid var(--line);border-left:2px solid var(--gold);
+  border-radius:0 8px 8px 0;padding:7px 11px;cursor:pointer;text-align:left;
+  font-family:inherit;color:var(--ink);transition:.15s;}
+.tr-donechip:hover{border-color:var(--gold);box-shadow:0 0 0 3px #F0D67A22;}
+.tr-donecheck{flex:0 0 auto;color:var(--gold);font-size:12px;font-weight:700;line-height:1;}
+.tr-doneprev{flex:1 1 auto;min-width:0;font-size:12.5px;line-height:1.4;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.tr-doneedit{flex:0 0 auto;color:var(--gold);font-size:10.5px;font-weight:600;letter-spacing:.04em;
+  text-transform:uppercase;opacity:.7;}
+.tr-donechip:hover .tr-doneedit{opacity:1;}
+.tr-notedone{margin-top:7px;background:transparent;border:0;color:var(--gold);font-size:11.5px;
+  font-weight:600;cursor:pointer;padding:0;letter-spacing:.02em;border-bottom:1px solid transparent;transition:.15s;}
+.tr-notedone:hover{border-bottom-color:var(--gold);}
+.tr-root[data-appearance="dark"] .tr-donechip{background:#2A2012;}
+
 /* consigliere */
 .tr-consig{margin-top:24px;padding:22px 22px 20px;border-radius:16px;position:relative;
   background:linear-gradient(160deg,#FCF6E6,#F7EFD9);border:1px solid var(--gold);

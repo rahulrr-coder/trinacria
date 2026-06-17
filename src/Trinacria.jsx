@@ -634,15 +634,29 @@ export default function Trinacria() {
                       </div>
                       <p className="tr-label">{b.label}</p>
                       {b.note && <p className="tr-note">{b.note}</p>}
-                      <button className="tr-notebtn" onClick={() => setOpenNote(noteOpen ? null : b.id)}>
-                        {today ? "edit what you did" : "add what you did"}
-                      </button>
-                      {noteOpen && (
-                        <textarea className="tr-noteinput" autoFocus rows={2} value={today}
-                          placeholder={b.cat === "dsa" ? "today’s problem + pattern — e.g. ‘Two Sum — hashmap’" : "what actually happened here?"}
-                          onChange={(e) => setNote(b.id, e.target.value)} />
+                      {!today && !noteOpen && (
+                        <button className="tr-notebtn" onClick={() => setOpenNote(b.id)}>
+                          add what you did
+                        </button>
                       )}
-                      {!noteOpen && today && <p className="tr-donenote">{today}</p>}
+                      {today && !noteOpen && (
+                        <button className="tr-donechip" onClick={() => setOpenNote(b.id)}
+                          title="Click to view or edit">
+                          <span className="tr-donecheck">✓</span>
+                          <span className="tr-doneprev">{today}</span>
+                          <span className="tr-doneedit">edit</span>
+                        </button>
+                      )}
+                      {noteOpen && (
+                        <>
+                          <textarea className="tr-noteinput" autoFocus rows={2} value={today}
+                            placeholder={b.cat === "dsa" ? "today’s problem + pattern — e.g. ‘Two Sum — hashmap’" : "what actually happened here?"}
+                            onChange={(e) => setNote(b.id, e.target.value)} />
+                          <button className="tr-notedone" onClick={() => setOpenNote(null)}>
+                            {today ? "done" : "close"}
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 </li>
