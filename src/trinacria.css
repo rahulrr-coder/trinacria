@@ -354,7 +354,7 @@
 .tr-node.pulse{box-shadow:0 0 0 0 var(--c);animation:npulse 2.2s infinite;}
 @keyframes npulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--c) 55%,transparent);}70%{box-shadow:0 0 0 9px transparent;}100%{box-shadow:0 0 0 0 transparent;}}
 
-.tr-tile{flex:1;display:flex;gap:13px;padding:16px 18px;margin-bottom:14px;border-radius:14px;
+.tr-tile{flex:1;min-width:0;display:flex;gap:13px;padding:16px 18px;margin-bottom:14px;border-radius:14px;
   background:linear-gradient(180deg,var(--cream),#FFFAEF);
   border:1px solid var(--border);border-left:4px solid var(--c);
   box-shadow:0 1px 3px var(--shadow);transition:transform .2s,box-shadow .2s,border-color .2s;}
