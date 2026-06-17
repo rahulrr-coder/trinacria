@@ -179,6 +179,38 @@
 .tr-emblemdot{width:9px;height:9px;border-radius:50%;flex:0 0 9px;}
 .tr-emblemname{font-weight:600;color:var(--ink);}
 .tr-emblempct{font-family:"Fraunces",serif;font-weight:600;color:var(--gold);font-variant-numeric:tabular-nums;}
+
+/* ---- lock screen ---- */
+.tr-lockscrim{position:fixed;inset:0;z-index:80;display:flex;align-items:center;justify-content:center;
+  padding:24px;background:
+    radial-gradient(120% 60% at 50% -6%, color-mix(in srgb,var(--accent) 22%,transparent), transparent 60%),
+    var(--ivory);
+  animation:fade .3s ease;}
+.tr-lockcard{display:flex;flex-direction:column;align-items:center;text-align:center;gap:4px;
+  width:100%;max-width:340px;padding:36px 32px 30px;border-radius:22px;
+  background:var(--cream);border:1px solid var(--gold);
+  box-shadow:0 24px 70px var(--shadow),0 0 60px -22px color-mix(in srgb,var(--gold) 60%,transparent);
+  animation:embpop .45s cubic-bezier(.2,1.25,.35,1) both;}
+.tr-lockmark{font-size:30px;margin-bottom:6px;filter:drop-shadow(0 2px 6px var(--shadow));}
+.tr-lockeyebrow{margin:0;font-family:"Fraunces",serif;font-style:italic;font-size:12px;font-weight:600;
+  color:var(--gold);text-transform:lowercase;letter-spacing:.05em;}
+.tr-locktitle{margin:2px 0 0;font-family:"Fraunces",serif;font-weight:600;font-size:24px;color:var(--ink);letter-spacing:-.01em;}
+.tr-locksub{margin:6px 0 14px;font-size:13px;line-height:1.5;color:var(--soft);}
+.tr-lockinput{width:100%;background:var(--ivory);border:1px solid var(--line);border-radius:11px;
+  color:var(--ink);padding:12px 14px;font-size:14px;font-family:inherit;text-align:center;letter-spacing:.06em;}
+.tr-lockinput:focus{outline:none;border-color:var(--gold);box-shadow:0 0 0 3px #F0D67A33;}
+.tr-lockerr{margin:9px 0 0;font-size:12.5px;color:#C8472B;font-weight:600;}
+.tr-lockbtn{margin-top:14px;width:100%;padding:12px;border:0;border-radius:11px;background:var(--gold);
+  color:#fff;font-size:14px;font-weight:700;cursor:pointer;font-family:inherit;transition:.15s;}
+.tr-lockbtn:hover:not(:disabled){background:var(--golddeep);}
+.tr-lockbtn:disabled{opacity:.5;cursor:default;}
+.tr-root[data-appearance="dark"] .tr-lockbtn{color:#1A140A;}
+
+/* settings privacy bits */
+.tr-setwarn{margin:0 0 11px;font-size:12.5px;line-height:1.5;color:var(--golddeep);
+  background:#FFF6DF;border-left:2px solid var(--gold);border-radius:0 8px 8px 0;padding:9px 12px;}
+.tr-root[data-appearance="dark"] .tr-setwarn{background:#2A2012;color:var(--goldlite);}
+.tr-pwfield{margin-top:0;margin-bottom:9px;}
 .tr-setrow{display:flex;align-items:center;gap:14px;margin-bottom:14px;}
 .tr-setlabel{flex:0 0 78px;font-size:12px;font-weight:600;color:var(--soft);text-transform:uppercase;letter-spacing:.06em;}
 .tr-provsel{display:flex;gap:7px;}

@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { createGist, pullGist, pushGist, mergeState } from "./sync.js";
+import { cryptoReady, isEnvelope, randomSalt, deriveKey, encryptJSON, decryptJSON, VERIFIER } from "./crypto.js";
 import "./trinacria.css";
 
 /* Optional secure proxy (a Cloudflare Worker holding the real secrets).
@@ -104,6 +105,8 @@ const K_L = "trinacria_logs_v1";
 const K_AI = "trinacria_ai_v1";
 const K_KEY = "trinacria_aikey_v1";
 const K_GH = "trinacria_gh_v1";
+const K_SEC = "trinacria_sec_v1";     // { salt, check } — present iff encryption is on
+const K_VAULT = "trinacria_vault_v1"; // encrypted snapshot envelope (replaces K_T/K_L/K_AI)
 
 /* a single portable snapshot of everything worth keeping — used by
  * both file export/import and gist sync, so they never drift apart. */
@@ -162,6 +165,11 @@ export default function Trinacria() {
   const [apiKey, setApiKey] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [emblemOpen, setEmblemOpen] = useState(false);
+  // ---- at-rest encryption (one password) ----
+  const [secured, setSecured] = useState(false);   // encryption enabled on this device
+  const [locked, setLocked] = useState(false);     // needs password before data is usable
+  const cryptoRef = useRef({ key: null, salt: null, password: null });
+  const pendingEnvRef = useRef(null);              // remote envelope awaiting unlock
   const [aiInput, setAiInput] = useState("");
   const [aiOut, setAiOut] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
@@ -182,20 +190,34 @@ export default function Trinacria() {
   useEffect(() => {
     let alive = true;
     (async () => {
-      const [t, l, a, k, g] = await Promise.all([sGet(K_T), sGet(K_L), sGet(K_AI), sGet(K_KEY), sGet(K_GH)]);
+      const [g, sec] = await Promise.all([sGet(K_GH), sGet(K_SEC)]);
+      if (!alive) return;
+      if (g?.token && g?.gistId) { setGh(g); setGhToken(g.token); }
+      // Encrypted vault present -> show the lock screen; data loads on unlock.
+      if (sec?.salt && sec?.check) { setSecured(true); setLocked(true); setLoaded(true); return; }
+      const [t, l, a, k] = await Promise.all([sGet(K_T), sGet(K_L), sGet(K_AI), sGet(K_KEY)]);
       if (!alive) return;
       if (t?.weekday && t?.weekend) setTemplates(t);
       if (l) setLogs(l);
       if (a) setAiCfg((p) => ({ ...p, ...a }));
       if (a?.remember && k?.key) setApiKey(k.key);
-      if (g?.token && g?.gistId) { setGh(g); setGhToken(g.token); }
       setLoaded(true);
     })();
     return () => { alive = false; };
   }, []);
-  useEffect(() => { if (loaded) sSet(K_T, templates); }, [templates, loaded]);
-  useEffect(() => { if (loaded) sSet(K_L, logs); }, [logs, loaded]);
-  useEffect(() => { if (loaded) sSet(K_AI, aiCfg); }, [aiCfg, loaded]);
+  // plaintext persistence — only when NOT encrypted
+  useEffect(() => { if (loaded && !secured) sSet(K_T, templates); }, [templates, loaded, secured]);
+  useEffect(() => { if (loaded && !secured) sSet(K_L, logs); }, [logs, loaded, secured]);
+  useEffect(() => { if (loaded && !secured) sSet(K_AI, aiCfg); }, [aiCfg, loaded, secured]);
+  // encrypted-vault persistence — only when unlocked
+  useEffect(() => {
+    if (!loaded || !secured || locked || !cryptoRef.current.key) return;
+    const id = setTimeout(async () => {
+      const { key, salt } = cryptoRef.current;
+      try { await sSet(K_VAULT, await encryptJSON(key, salt, snapshotOf(stateRef.current))); } catch { /* skip */ }
+    }, 600);
+    return () => clearTimeout(id);
+  }, [templates, logs, aiCfg, loaded, secured, locked]);
   useEffect(() => { const id = setInterval(() => setNow(new Date()), 60000); return () => clearInterval(id); }, []);
   useEffect(() => { if (loaded && aiCfg.remember && apiKey.trim()) sSet(K_KEY, { key: apiKey.trim() }); }, [apiKey, aiCfg.remember, loaded]);
   useEffect(() => { if (loaded) sSet(K_GH, gh); }, [gh, loaded]);
@@ -293,14 +315,29 @@ export default function Trinacria() {
   const sigOf = (snap) => JSON.stringify({ templates: snap?.templates, logs: snap?.logs });
   const lastSyncedSig = useRef(null);   // signature last pulled/pushed
   const syncingRef = useRef(false);     // guard against overlapping syncs
+  const LOCKED = "__locked__";
+  // Turn whatever the gist holds into a plain snapshot. Encrypted gists are
+  // decrypted with the in-memory key; if we don't have it, stash the envelope
+  // and signal the caller to raise the lock screen.
+  const decodeRemote = async (raw) => {
+    if (!raw || !isEnvelope(raw)) return raw;
+    const cr = cryptoRef.current;
+    if (cr.password) {
+      const key = raw.salt === cr.salt ? cr.key : await deriveKey(cr.password, raw.salt);
+      try { return await decryptJSON(key, raw); } catch { /* fall through */ }
+    }
+    pendingEnvRef.current = raw;
+    setLocked(true);
+    throw new Error(LOCKED);
+  };
   const syncNow = async () => {
     const { token, gistId } = gh;
     if (!canSync(token, gistId)) return;
-    if (syncingRef.current) return;
+    if (syncingRef.current || locked) return;
     syncingRef.current = true;
     setSyncState("syncing"); setSyncErr("");
     try {
-      const remote = await pullGist(connOf(token), gistId);
+      const remote = await decodeRemote(await pullGist(connOf(token), gistId));
       const merged = mergeState(snapshotOf(stateRef.current), remote);
       const mergedSig = sigOf(merged);
       // Remember this signature *before* applying state, so the re-render the
@@ -310,10 +347,17 @@ export default function Trinacria() {
       setTemplates(merged.templates);
       setLogs(merged.logs);
       // Only write when the merge actually differs from what's in the gist.
-      if (sigOf(remote) !== mergedSig) await pushGist(connOf(token), gistId, merged);
+      if (sigOf(remote) !== mergedSig) {
+        const cr = cryptoRef.current;
+        const payload = secured && cr.key ? await encryptJSON(cr.key, cr.salt, merged) : merged;
+        await pushGist(connOf(token), gistId, payload);
+      }
       setGh((p) => ({ ...p, lastSync: Date.now() }));
       setSyncState("synced");
-    } catch (e) { setSyncErr(String(e.message || e)); setSyncState("error"); }
+    } catch (e) {
+      if (String(e.message) === LOCKED) { setSyncState("idle"); }
+      else { setSyncErr(String(e.message || e)); setSyncState("error"); }
+    }
     finally { syncingRef.current = false; }
   };
   // keep a stable handle so the debounce effect needn't depend on syncNow
@@ -326,7 +370,12 @@ export default function Trinacria() {
     setSyncState("syncing"); setSyncErr("");
     try {
       let gistId = gh.gistId;
-      if (!gistId) gistId = await createGist(connOf(token), snapshotOf(stateRef.current));
+      if (!gistId) {
+        const cr = cryptoRef.current;
+        const seed = snapshotOf(stateRef.current);
+        const payload = secured && cr.key ? await encryptJSON(cr.key, cr.salt, seed) : seed;
+        gistId = await createGist(connOf(token), payload);
+      }
       setGh({ token: useProxy ? "" : token, gistId, lastSync: Date.now() });
       setSyncState("synced");
     } catch (e) { setSyncErr(String(e.message || e)); setSyncState("error"); }
@@ -334,6 +383,77 @@ export default function Trinacria() {
   const disconnectGist = () => {
     setGh({ token: "", gistId: "", lastSync: 0 });
     setGhToken(""); setSyncState("idle"); setSyncErr("");
+  };
+
+  /* ---- at-rest encryption handlers ---- */
+  const applySnap = (snap) => {
+    if (snap?.templates?.weekday && snap?.templates?.weekend) setTemplates(snap.templates);
+    if (snap?.logs) setLogs(snap.logs);
+    if (snap?.aiCfg) setAiCfg((p) => ({ ...p, ...snap.aiCfg }));
+  };
+  // Unlock at boot (local vault) or adopt encryption from a synced gist.
+  const tryUnlock = async (password) => {
+    if (!password) return "Enter your password.";
+    if (!cryptoReady()) return "Encryption isn’t available in this browser.";
+    const sec = await sGet(K_SEC);
+    if (sec?.salt && sec?.check) {
+      let key;
+      try {
+        key = await deriveKey(password, sec.salt);
+        await decryptJSON(key, sec.check);            // throws on wrong password
+      } catch { return "Wrong password."; }
+      cryptoRef.current = { key, salt: sec.salt, password };
+      const vault = await sGet(K_VAULT);
+      if (isEnvelope(vault)) { try { applySnap(await decryptJSON(key, vault)); } catch { /* corrupt */ } }
+      setSecured(true); setLocked(false); pendingEnvRef.current = null;
+      if (canSync(gh.token, gh.gistId)) syncRef.current();
+      return null;
+    }
+    // No local vault, but a synced gist arrived encrypted -> adopt it here.
+    const pend = pendingEnvRef.current;
+    if (isEnvelope(pend)) {
+      let snap;
+      try { snap = await decryptJSON(await deriveKey(password, pend.salt), pend); }
+      catch { return "Wrong password."; }
+      const salt = randomSalt();
+      const key = await deriveKey(password, salt);
+      await sSet(K_SEC, { salt, check: await encryptJSON(key, salt, VERIFIER) });
+      await sSet(K_VAULT, await encryptJSON(key, salt, snap));
+      await Promise.all([sDel(K_T), sDel(K_L), sDel(K_AI)]);
+      cryptoRef.current = { key, salt, password };
+      applySnap(snap);
+      setSecured(true); setLocked(false); pendingEnvRef.current = null;
+      return null;
+    }
+    return "Nothing to unlock on this device.";
+  };
+  // Turn encryption on from settings.
+  const enableLock = async (password) => {
+    if (!cryptoReady()) return "Encryption isn’t available in this browser.";
+    if ((password || "").length < 4) return "Use at least 4 characters.";
+    const salt = randomSalt();
+    const key = await deriveKey(password, salt);
+    await sSet(K_SEC, { salt, check: await encryptJSON(key, salt, VERIFIER) });
+    await sSet(K_VAULT, await encryptJSON(key, salt, snapshotOf(stateRef.current)));
+    await Promise.all([sDel(K_T), sDel(K_L), sDel(K_AI)]);
+    cryptoRef.current = { key, salt, password };
+    setSecured(true); setLocked(false);
+    if (canSync(gh.token, gh.gistId)) syncRef.current();   // re-push encrypted
+    return null;
+  };
+  // Turn encryption off — write plaintext back and re-push it.
+  const disableLock = async () => {
+    const snap = snapshotOf(stateRef.current);
+    await Promise.all([sSet(K_T, snap.templates), sSet(K_L, snap.logs), sSet(K_AI, aiCfg)]);
+    await Promise.all([sDel(K_SEC), sDel(K_VAULT)]);
+    cryptoRef.current = { key: null, salt: null, password: null };
+    setSecured(false); setLocked(false);
+    if (canSync(gh.token, gh.gistId)) setTimeout(() => syncRef.current(), 0);
+  };
+  // Quick re-lock (shared device) without removing encryption.
+  const lockNow = () => {
+    cryptoRef.current = { key: null, salt: null, password: null };
+    setLocked(true); setSettingsOpen(false);
   };
 
   // pull + merge once we're connected (covers boot and the moment of connecting)
@@ -465,6 +585,9 @@ export default function Trinacria() {
         </div>
       )}
 
+      {/* ---------------- LOCK SCREEN ---------------- */}
+      {locked && <LockScreen remote={!secured} onUnlock={tryUnlock} />}
+
       {/* ---------------- EMBLEM SHOWCASE ---------------- */}
       {emblemOpen && (
         <EmblemShowcase activeStream={weekendView ? null : activeStream} progress={streamPct} onClose={() => setEmblemOpen(false)} />
@@ -561,6 +684,8 @@ export default function Trinacria() {
                 {syncErr && <p className="tr-datamsg tr-syncerr">{syncErr}</p>}
                 {gh.gistId && <p className="tr-setnote">Linked gist <b>{gh.gistId.slice(0, 8)}…</b>{useProxy ? " · via your proxy." : " · token stays only in this browser."}</p>}
               </section>
+
+              <PrivacySection secured={secured} onEnable={enableLock} onDisable={disableLock} onLockNow={lockNow} />
 
               <section className="tr-section">
                 <h3 className="tr-sectitle">Your data</h3>
@@ -830,6 +955,95 @@ function TriskeleArt({ activeStream, progress = {}, size = 64 }) {
       <circle cx="50" cy="50" r="6.5" fill="url(#gold)" stroke="#8C6D1F" strokeWidth="0.8" />
       <circle cx="48" cy="48" r="2" fill="#FBEFC2" opacity="0.8" />
     </svg>
+  );
+}
+
+/* Settings → Privacy: enable / remove / quick-lock the password. */
+function PrivacySection({ secured, onEnable, onDisable, onLockNow }) {
+  const [open, setOpen] = useState(false);
+  const [pw, setPw] = useState("");
+  const [pw2, setPw2] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const reset = () => { setOpen(false); setPw(""); setPw2(""); setMsg(""); };
+  const enable = async () => {
+    if (pw !== pw2) { setMsg("Passwords don’t match."); return; }
+    setBusy(true); setMsg("");
+    const err = await onEnable(pw);
+    setBusy(false);
+    if (err) setMsg(err); else reset();
+  };
+  const disable = async () => {
+    if (!window.confirm("Remove the password and store your data unencrypted?")) return;
+    setBusy(true); await onDisable(); setBusy(false);
+  };
+  return (
+    <section className="tr-section">
+      <h3 className="tr-sectitle">Privacy · lock</h3>
+      {secured ? (
+        <>
+          <p className="tr-setnote">🔒 Encrypted with your password — on this device and in sync. Only the password can read it.</p>
+          <div className="tr-databtns">
+            <button className="tr-databtn" onClick={onLockNow}>Lock now</button>
+            <button className="tr-databtn" onClick={disable} disabled={busy}>Remove lock</button>
+          </div>
+        </>
+      ) : !open ? (
+        <>
+          <p className="tr-setnote">Lock Trinacria behind one password. Your day is encrypted at rest — in this browser and in your synced gist.</p>
+          <button className="tr-databtn" onClick={() => setOpen(true)}>🔒 Set a password</button>
+        </>
+      ) : (
+        <>
+          <p className="tr-setwarn">⚠ If you forget this password your data can’t be recovered — there’s no reset.</p>
+          <input className="tr-noteinput tr-pwfield" type="password" placeholder="new password" autoFocus
+            autoComplete="new-password" value={pw} onChange={(e) => setPw(e.target.value)} />
+          <input className="tr-noteinput tr-pwfield" type="password" placeholder="confirm password"
+            autoComplete="new-password" value={pw2} onChange={(e) => setPw2(e.target.value)} />
+          <div className="tr-databtns">
+            <button className="tr-databtn" onClick={reset}>Cancel</button>
+            <button className="tr-connect" onClick={enable} disabled={busy || !pw}>{busy ? "encrypting…" : "Encrypt my data"}</button>
+          </div>
+        </>
+      )}
+      {msg && <p className="tr-datamsg tr-syncerr">{msg}</p>}
+    </section>
+  );
+}
+
+/* Lock screen — covers everything until the password unlocks the vault. */
+function LockScreen({ remote, onUnlock }) {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async (e) => {
+    e?.preventDefault();
+    if (busy || !pw) return;
+    setBusy(true); setErr("");
+    const msg = await onUnlock(pw);
+    setBusy(false);
+    if (msg) setErr(msg); else setPw("");
+  };
+  return (
+    <div className="tr-lockscrim">
+      <form className="tr-lockcard" onSubmit={submit} role="dialog" aria-modal="true" aria-label="Locked">
+        <div className="tr-lockmark" aria-hidden="true">🔒</div>
+        <p className="tr-lockeyebrow">Sotto chiave</p>
+        <h2 className="tr-locktitle">Trinacria is locked</h2>
+        <p className="tr-locksub">
+          {remote
+            ? "Your synced day is encrypted. Enter your password to unlock it on this device."
+            : "Enter your password to open your day."}
+        </p>
+        <input className="tr-lockinput" type="password" autoFocus value={pw}
+          placeholder="password" autoComplete="current-password"
+          onChange={(e) => setPw(e.target.value)} aria-label="Password" />
+        {err && <p className="tr-lockerr">{err}</p>}
+        <button className="tr-lockbtn" type="submit" disabled={busy || !pw}>
+          {busy ? "unlocking…" : "Unlock"}
+        </button>
+      </form>
+    </div>
   );
 }
 
