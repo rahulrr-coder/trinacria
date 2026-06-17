@@ -308,7 +308,9 @@ export default function Trinacria() {
 
   /* ---- multi-device sync (proxy or direct gist) ---- */
   const connOf = (token) => ({ token, proxy: PROXY, secret: PROXY_SECRET });
-  const canSync = (token, gistId) => !!gistId && (useProxy || !!token);
+  // Proxy mode: the Worker owns the gist, so sync is always on. Direct mode
+  // (no proxy) still needs a token + a gist id the user supplied.
+  const canSync = () => useProxy || (!!gh.token && !!gh.gistId);
   // Stable signature of the *shared* payload (excludes the volatile exportedAt
   // timestamp). Used to skip no-op syncs and break the self-trigger loop that
   // otherwise hammered GitHub into a 403 rate-limit.
@@ -332,7 +334,7 @@ export default function Trinacria() {
   };
   const syncNow = async () => {
     const { token, gistId } = gh;
-    if (!canSync(token, gistId)) return;
+    if (!canSync()) return;
     if (syncingRef.current || locked) return;
     syncingRef.current = true;
     setSyncState("syncing"); setSyncErr("");
@@ -406,7 +408,7 @@ export default function Trinacria() {
       const vault = await sGet(K_VAULT);
       if (isEnvelope(vault)) { try { applySnap(await decryptJSON(key, vault)); } catch { /* corrupt */ } }
       setSecured(true); setLocked(false); pendingEnvRef.current = null;
-      if (canSync(gh.token, gh.gistId)) syncRef.current();
+      if (canSync()) syncRef.current();
       return null;
     }
     // No local vault, but a synced gist arrived encrypted -> adopt it here.
@@ -438,7 +440,7 @@ export default function Trinacria() {
     await Promise.all([sDel(K_T), sDel(K_L), sDel(K_AI)]);
     cryptoRef.current = { key, salt, password };
     setSecured(true); setLocked(false);
-    if (canSync(gh.token, gh.gistId)) syncRef.current();   // re-push encrypted
+    if (canSync()) syncRef.current();   // re-push encrypted
     return null;
   };
   // Turn encryption off — write plaintext back and re-push it.
@@ -448,7 +450,7 @@ export default function Trinacria() {
     await Promise.all([sDel(K_SEC), sDel(K_VAULT)]);
     cryptoRef.current = { key: null, salt: null, password: null };
     setSecured(false); setLocked(false);
-    if (canSync(gh.token, gh.gistId)) setTimeout(() => syncRef.current(), 0);
+    if (canSync()) setTimeout(() => syncRef.current(), 0);
   };
   // Quick re-lock (shared device) without removing encryption.
   const lockNow = () => {
@@ -456,19 +458,20 @@ export default function Trinacria() {
     setLocked(true); setSettingsOpen(false);
   };
 
-  // pull + merge once we're connected (covers boot and the moment of connecting)
+  const syncReady = useProxy || (!!gh.token && !!gh.gistId);
+  // pull + merge once we're ready (covers boot and the moment of connecting)
   useEffect(() => {
-    if (loaded && canSync(gh.token, gh.gistId)) syncRef.current();
-  }, [loaded, gh.token, gh.gistId]);
-  // debounced push whenever data *actually* changes while connected.
+    if (loaded && syncReady) syncRef.current();
+  }, [loaded, syncReady]);
+  // debounced push whenever data *actually* changes while ready.
   // The signature check is what stops a sync-induced re-render from
   // rescheduling another sync forever.
   useEffect(() => {
-    if (!loaded || !canSync(gh.token, gh.gistId)) return;
+    if (!loaded || !syncReady) return;
     if (sigOf(snapshotOf(stateRef.current)) === lastSyncedSig.current) return;
     const id = setTimeout(() => syncRef.current(), 6000);
     return () => clearTimeout(id);
-  }, [templates, logs, loaded, gh.token, gh.gistId]);
+  }, [templates, logs, loaded, syncReady]);
   const syncLabel = syncState === "syncing" ? "syncing…"
     : syncState === "error" ? "sync error"
     : gh.gistId ? (gh.lastSync ? `synced ${new Date(gh.lastSync).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "connected")
