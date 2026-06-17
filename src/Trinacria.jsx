@@ -922,45 +922,72 @@ const EMBLEM_ARMS = [
   { ang: 210, stream: "DeckView", c: CATS.deckview.color, name: CATS.deckview.name },
 ];
 
-/* The triskele itself — reused at any size by the header button and showcase. */
+/* The Trinacria proper — a Gorgon (Medusa) head with snake hair at the hub and
+   three bent running legs, each lit by its stream's progress. Reused at any size
+   by the header button and the showcase. */
 function TriskeleArt({ activeStream, progress = {}, size = 64 }) {
-  const cx = 50, cy = 50, r = 30, curl = 24;
-  const path = (deg) => {
-    const a = (deg * Math.PI) / 180;
-    const ex = cx + r * Math.cos(a), ey = cy - r * Math.sin(a);
-    const mx = cx + r * 0.5 * Math.cos(a), my = cy - r * 0.5 * Math.sin(a);
-    const pa = a + Math.PI / 2;
-    const ccx = mx + curl * Math.cos(pa), ccy = my - curl * Math.sin(pa);
-    return { d: `M${cx} ${cy} Q ${ccx.toFixed(1)} ${ccy.toFixed(1)} ${ex.toFixed(1)} ${ey.toFixed(1)}`, ex, ey };
-  };
+  const C = 50;
+  // one bent leg pointing up, knee bending clockwise; rotated 120° for the trio
+  const LEG = "M50 50 L50 30 Q50 23 57 21.8 L71 18.5";
+  // a writhing halo of little snakes around the head
+  const snakes = Array.from({ length: 12 }, (_, i) => {
+    const a = ((i * 30 - 90) * Math.PI) / 180;
+    const r0 = 11, r1 = 18.5;
+    const ta = a + Math.PI / 2;
+    const mx = C + ((r0 + r1) / 2) * Math.cos(a) + 3.4 * Math.cos(ta);
+    const my = C + ((r0 + r1) / 2) * Math.sin(a) + 3.4 * Math.sin(ta);
+    const x0 = C + r0 * Math.cos(a), y0 = C + r0 * Math.sin(a);
+    const x1 = C + r1 * Math.cos(a), y1 = C + r1 * Math.sin(a);
+    return { d: `M${x0.toFixed(1)} ${y0.toFixed(1)} Q ${mx.toFixed(1)} ${my.toFixed(1)} ${x1.toFixed(1)} ${y1.toFixed(1)}`, hx: x1, hy: y1 };
+  });
   return (
     <svg className="tr-emblem" viewBox="0 0 100 100" width={size} height={size} aria-hidden="true">
       <defs>
         <radialGradient id="gold" cx="40%" cy="35%" r="75%">
           <stop offset="0%" stopColor="#F0D67A" /><stop offset="55%" stopColor="#C9A227" /><stop offset="100%" stopColor="#8C6D1F" />
         </radialGradient>
+        <radialGradient id="face" cx="42%" cy="36%" r="72%">
+          <stop offset="0%" stopColor="#FCEBB0" /><stop offset="58%" stopColor="#E6C766" /><stop offset="100%" stopColor="#B8912F" />
+        </radialGradient>
       </defs>
       <circle cx="50" cy="50" r="46" fill="none" stroke="url(#gold)" strokeWidth="1.4" opacity="0.55" />
       <circle cx="50" cy="50" r="40" fill="none" stroke="url(#gold)" strokeWidth="0.7" opacity="0.4" />
-      {EMBLEM_ARMS.map((arm) => {
-        const p = path(arm.ang);
+
+      {/* three bent legs (drawn first; the head overlaps their hubs) */}
+      {EMBLEM_ARMS.map((arm, i) => {
         const live = activeStream === arm.stream;
         const prog = Math.max(0, Math.min(1, progress[arm.stream] || 0));
         return (
-          <g key={arm.stream} className={live ? "tr-armlive" : ""} style={live ? { color: arm.c } : undefined}>
-            {/* faint gold base — the unlit arm */}
-            <path d={p.d} fill="none" stroke="url(#gold)" strokeWidth="3.4" strokeLinecap="round" opacity="0.45" />
-            {/* coloured overlay reveals as that stream's blocks get done */}
-            <path d={p.d} fill="none" stroke={arm.c} strokeWidth="3.4" strokeLinecap="round"
+          <g key={arm.stream} transform={`rotate(${i * 120} 50 50)`} className={live ? "tr-armlive" : ""} style={live ? { color: arm.c } : undefined}>
+            <path d={LEG} fill="none" stroke="url(#gold)" strokeWidth="6.6" strokeLinecap="round" strokeLinejoin="round" opacity="0.5" />
+            <path d={LEG} fill="none" stroke={arm.c} strokeWidth="6.6" strokeLinecap="round" strokeLinejoin="round"
               pathLength="1" style={{ strokeDasharray: 1, strokeDashoffset: 1 - prog, transition: "stroke-dashoffset .6s ease" }} />
-            <circle cx={p.ex} cy={p.ey} r={live ? 7.5 : 6} fill={arm.c} fillOpacity={0.3 + 0.7 * prog}
-              stroke="url(#gold)" strokeWidth="1.6" />
-            {live && <circle cx={p.ex} cy={p.ey} r="6" fill="none" stroke={arm.c} strokeWidth="1.4" className="tr-armring" />}
+            {/* foot */}
+            <ellipse cx="71" cy="18.5" rx="6.2" ry="3.3" transform="rotate(-14 71 18.5)"
+              fill={arm.c} fillOpacity={0.35 + 0.65 * prog} stroke="url(#gold)" strokeWidth="1.4" />
+            {live && <circle cx="71" cy="18.5" r="7" fill="none" stroke={arm.c} strokeWidth="1.4" className="tr-armring" />}
           </g>
         );
       })}
-      <circle cx="50" cy="50" r="6.5" fill="url(#gold)" stroke="#8C6D1F" strokeWidth="0.8" />
-      <circle cx="48" cy="48" r="2" fill="#FBEFC2" opacity="0.8" />
+
+      {/* Gorgon head */}
+      <g>
+        {snakes.map((s, i) => (
+          <g key={i}>
+            <path d={s.d} fill="none" stroke="url(#gold)" strokeWidth="2.1" strokeLinecap="round" opacity="0.9" />
+            <circle cx={s.hx} cy={s.hy} r="1.6" fill="url(#gold)" />
+          </g>
+        ))}
+        <circle cx="50" cy="50" r="12" fill="url(#face)" stroke="url(#gold)" strokeWidth="1.4" />
+        {/* brows + eyes */}
+        <path d="M43.2 45.6 Q45.6 44.1 48.2 45.6" stroke="#7A5E22" strokeWidth="1" fill="none" strokeLinecap="round" />
+        <path d="M51.8 45.6 Q54.4 44.1 56.8 45.6" stroke="#7A5E22" strokeWidth="1" fill="none" strokeLinecap="round" />
+        <ellipse cx="45.7" cy="49" rx="1.7" ry="2.3" fill="#3A2A12" />
+        <ellipse cx="54.3" cy="49" rx="1.7" ry="2.3" fill="#3A2A12" />
+        {/* nose + mouth */}
+        <path d="M50 49.6 L48.9 53.4 Q50 54.3 51.1 53.4" stroke="#7A5E22" strokeWidth="1" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M46.8 56.6 Q50 58.2 53.2 56.6" stroke="#7A5E22" strokeWidth="1.1" fill="none" strokeLinecap="round" />
+      </g>
     </svg>
   );
 }
