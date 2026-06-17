@@ -7,20 +7,27 @@
  *
  *  Endpoints:
  *    GET  /api/health
- *    POST /api/ai            { provider, model, system, user }
- *    POST /api/sync/create   <snapshot json>            -> { id }
- *    GET  /api/sync?gist=ID                             -> snapshot json
- *    PUT  /api/sync?gist=ID  <snapshot json>            -> { ok: true }
+ *    POST /api/ai            { system, user }            (provider/model server-side)
+ *    GET  /api/sync                                      -> snapshot json
+ *    PUT  /api/sync          <snapshot json>             -> { ok: true }
+ *
+ *  The Worker owns the gist and the AI provider so the browser carries no
+ *  config: it just reads/writes the one GIST_ID and talks to the default
+ *  provider. (?gist= and a body { provider, model } are still honoured for
+ *  backward compatibility / local dev.)
  *
  *  Secrets (set via `wrangler secret put …`, never committed):
- *    GH_TOKEN, GROQ_KEY, SAMBANOVA_KEY (optional), APP_SECRET (optional)
- *  Vars (wrangler.toml): ALLOWED_ORIGINS (comma-separated)
+ *    GH_TOKEN, GROQ_KEY, SAMBANOVA_KEY (optional), APP_SECRET (optional),
+ *    GIST_ID (the one private gist this proxy reads/writes)
+ *  Vars (wrangler.toml): ALLOWED_ORIGINS, DEFAULT_PROVIDER, DEFAULT_MODEL
  * ============================================================ */
 
 const PROVIDERS = {
   groq: { url: "https://api.groq.com/openai/v1/chat/completions", keyVar: "GROQ_KEY" },
   sambanova: { url: "https://api.sambanova.ai/v1/chat/completions", keyVar: "SAMBANOVA_KEY" },
 };
+const FALLBACK_PROVIDER = "groq";
+const FALLBACK_MODEL = "llama-3.3-70b-versatile";
 const GH = "https://api.github.com";
 const GIST_FILE = "trinacria.json";
 
@@ -62,7 +69,12 @@ export default {
       if (url.pathname === "/api/health") return json({ ok: true }, 200, ch);
 
       if (url.pathname === "/api/ai" && req.method === "POST") {
-        const { provider, model, system, user } = await req.json();
+        const body = await req.json();
+        const { system, user } = body;
+        // Provider/model are owned by the proxy; a request body may still
+        // override them (local dev), otherwise fall back to env / defaults.
+        const provider = body.provider || env.DEFAULT_PROVIDER || FALLBACK_PROVIDER;
+        const model = body.model || env.DEFAULT_MODEL || FALLBACK_MODEL;
         const p = PROVIDERS[provider];
         if (!p) return json({ error: "unknown provider" }, 400, ch);
         const key = env[p.keyVar];
@@ -91,8 +103,9 @@ export default {
       }
 
       if (url.pathname === "/api/sync") {
-        const gist = url.searchParams.get("gist");
-        if (!gist) return json({ error: "missing gist id" }, 400, ch);
+        // The proxy owns the gist: prefer GIST_ID, fall back to ?gist= (dev/legacy).
+        const gist = env.GIST_ID || url.searchParams.get("gist");
+        if (!gist) return json({ error: "no GIST_ID configured on the proxy" }, 400, ch);
         if (req.method === "GET") {
           const r = await fetch(`${GH}/gists/${gist}`, { headers: ghHeaders });
           if (!r.ok) return json({ error: (await r.text()).slice(0, 200) }, r.status, ch);
