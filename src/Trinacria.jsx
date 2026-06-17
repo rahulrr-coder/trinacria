@@ -226,7 +226,11 @@ export default function Trinacria() {
   const appearance = themeMode === "notte" ? "dark" : themeMode === "light" ? "light" : (phase === "notte" ? "dark" : "light");
   const tintPhase = (appearance === "light" && phase === "notte") ? "sera" : phase;
   useEffect(() => {
-    document.body.style.background = appearance === "dark" ? "#0F0B06" : "#FAF3E4";
+    const pageBg = appearance === "dark" ? "#0F0B06" : "#FAF3E4";
+    // Set on <html> too: .tr-root's vertical margin collapses up to the html
+    // element, so an unstyled html would reveal a cream strip top & bottom in dark mode.
+    document.documentElement.style.background = pageBg;
+    document.body.style.background = pageBg;
     document.querySelector('meta[name="theme-color"]')?.setAttribute("content", appearance === "dark" ? "#16110A" : "#FAF3E4");
   }, [appearance]);
   useEffect(() => {
@@ -282,19 +286,34 @@ export default function Trinacria() {
   /* ---- multi-device sync (proxy or direct gist) ---- */
   const connOf = (token) => ({ token, proxy: PROXY, secret: PROXY_SECRET });
   const canSync = (token, gistId) => !!gistId && (useProxy || !!token);
+  // Stable signature of the *shared* payload (excludes the volatile exportedAt
+  // timestamp). Used to skip no-op syncs and break the self-trigger loop that
+  // otherwise hammered GitHub into a 403 rate-limit.
+  const sigOf = (snap) => JSON.stringify({ templates: snap?.templates, logs: snap?.logs });
+  const lastSyncedSig = useRef(null);   // signature last pulled/pushed
+  const syncingRef = useRef(false);     // guard against overlapping syncs
   const syncNow = async () => {
     const { token, gistId } = gh;
     if (!canSync(token, gistId)) return;
+    if (syncingRef.current) return;
+    syncingRef.current = true;
     setSyncState("syncing"); setSyncErr("");
     try {
       const remote = await pullGist(connOf(token), gistId);
       const merged = mergeState(snapshotOf(stateRef.current), remote);
+      const mergedSig = sigOf(merged);
+      // Remember this signature *before* applying state, so the re-render the
+      // setState triggers sees "nothing changed" and does not bounce back into
+      // another push (this was the runaway loop).
+      lastSyncedSig.current = mergedSig;
       setTemplates(merged.templates);
       setLogs(merged.logs);
-      await pushGist(connOf(token), gistId, merged);
+      // Only write when the merge actually differs from what's in the gist.
+      if (sigOf(remote) !== mergedSig) await pushGist(connOf(token), gistId, merged);
       setGh((p) => ({ ...p, lastSync: Date.now() }));
       setSyncState("synced");
     } catch (e) { setSyncErr(String(e.message || e)); setSyncState("error"); }
+    finally { syncingRef.current = false; }
   };
   // keep a stable handle so the debounce effect needn't depend on syncNow
   const syncRef = useRef(syncNow);
@@ -320,10 +339,13 @@ export default function Trinacria() {
   useEffect(() => {
     if (loaded && canSync(gh.token, gh.gistId)) syncRef.current();
   }, [loaded, gh.token, gh.gistId]);
-  // debounced push whenever data changes while connected
+  // debounced push whenever data *actually* changes while connected.
+  // The signature check is what stops a sync-induced re-render from
+  // rescheduling another sync forever.
   useEffect(() => {
     if (!loaded || !canSync(gh.token, gh.gistId)) return;
-    const id = setTimeout(() => syncRef.current(), 4000);
+    if (sigOf(snapshotOf(stateRef.current)) === lastSyncedSig.current) return;
+    const id = setTimeout(() => syncRef.current(), 6000);
     return () => clearTimeout(id);
   }, [templates, logs, loaded, gh.token, gh.gistId]);
   const syncLabel = syncState === "syncing" ? "syncing…"
