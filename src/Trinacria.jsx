@@ -137,7 +137,8 @@ async function askAI({ provider, apiKey, model, system, user }) {
     ? await fetch(`${PROXY}/api/ai`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(PROXY_SECRET ? { "X-App-Secret": PROXY_SECRET } : {}) },
-        body: JSON.stringify({ provider, model, system, user }),
+        // provider/model are owned by the proxy — the browser doesn't send them
+        body: JSON.stringify({ system, user }),
       })
     : await fetch(PROVIDERS[provider].url, {
         method: "POST",
@@ -474,8 +475,8 @@ export default function Trinacria() {
   }, [templates, logs, loaded, syncReady]);
   const syncLabel = syncState === "syncing" ? "syncing…"
     : syncState === "error" ? "sync error"
-    : gh.gistId ? (gh.lastSync ? `synced ${new Date(gh.lastSync).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "connected")
-    : "not connected";
+    : gh.lastSync ? `synced ${new Date(gh.lastSync).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+    : syncReady ? "connected" : "not connected";
 
   /* ---- reminders: nudge when a block becomes "now" (app open) ---- */
   const notify = !!aiCfg.notify;
@@ -626,25 +627,25 @@ export default function Trinacria() {
 
               <section className="tr-section">
                 <h3 className="tr-sectitle">Il Consigliere · AI</h3>
-                <div className="tr-setrow">
-                  <span className="tr-setlabel">Provider</span>
-                  <div className="tr-provsel">
-                    {Object.keys(PROVIDERS).map((k) => (
-                      <button key={k} className={`tr-prov ${aiCfg.provider === k ? "on" : ""}`}
-                        onClick={() => setAiCfg((p) => ({ ...p, provider: k, model: PROVIDERS[k].models[0] }))}>{PROVIDERS[k].name}</button>
-                    ))}
-                  </div>
-                </div>
-                <div className="tr-setrow">
-                  <span className="tr-setlabel">Model</span>
-                  <select className="tr-modelsel" value={aiCfg.model} onChange={(e) => setAiCfg((p) => ({ ...p, model: e.target.value }))}>
-                    {PROVIDERS[aiCfg.provider].models.map((m) => <option key={m} value={m}>{m}</option>)}
-                  </select>
-                </div>
                 {useProxy ? (
-                  <p className="tr-setnote">🔒 Keys are held by your secure proxy — nothing to enter here.</p>
+                  <p className="tr-setnote">🔒 Your consigliere runs on <b>Groq</b> through your secure proxy — the key and model are handled server-side, nothing to set here.</p>
                 ) : (
                   <>
+                    <div className="tr-setrow">
+                      <span className="tr-setlabel">Provider</span>
+                      <div className="tr-provsel">
+                        {Object.keys(PROVIDERS).map((k) => (
+                          <button key={k} className={`tr-prov ${aiCfg.provider === k ? "on" : ""}`}
+                            onClick={() => setAiCfg((p) => ({ ...p, provider: k, model: PROVIDERS[k].models[0] }))}>{PROVIDERS[k].name}</button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="tr-setrow">
+                      <span className="tr-setlabel">Model</span>
+                      <select className="tr-modelsel" value={aiCfg.model} onChange={(e) => setAiCfg((p) => ({ ...p, model: e.target.value }))}>
+                        {PROVIDERS[aiCfg.provider].models.map((m) => <option key={m} value={m}>{m}</option>)}
+                      </select>
+                    </div>
                     <div className="tr-setrow">
                       <span className="tr-setlabel">API key</span>
                       <input className="tr-keyinput" type="password" value={apiKey} placeholder={PROVIDERS[aiCfg.provider].keyHint}
@@ -662,7 +663,10 @@ export default function Trinacria() {
               <section className="tr-section">
                 <h3 className="tr-sectitle">Sync · across devices</h3>
                 {useProxy ? (
-                  <p className="tr-setnote">🔒 Synced through your secure proxy — no token needed. Just turn it on.</p>
+                  <>
+                    <p className="tr-setnote">🔒 Synced automatically across your devices through your secure proxy — nothing to set up.</p>
+                    <span className={`tr-syncstat is-${syncState}`}><i className="tr-syncdot" />{syncLabel}</span>
+                  </>
                 ) : (
                   <>
                     <p className="tr-setnote">Keep your day in step on phone and laptop through a <b>private GitHub gist</b>. Use a token with <b>only the gist scope</b>.</p>
@@ -671,21 +675,21 @@ export default function Trinacria() {
                       <input className="tr-keyinput" type="password" value={ghToken} placeholder="github_pat_… / ghp_…"
                         onChange={(e) => setGhToken(e.target.value)} />
                     </div>
+                    {gh.gistId ? (
+                      <div className="tr-syncrow">
+                        <span className={`tr-syncstat is-${syncState}`}><i className="tr-syncdot" />{syncLabel}</span>
+                        <button className="tr-databtn" onClick={syncNow} disabled={syncState === "syncing"}>Sync now</button>
+                        <button className="tr-databtn" onClick={disconnectGist}>Disconnect</button>
+                      </div>
+                    ) : (
+                      <button className="tr-connect" onClick={connectGist} disabled={syncState === "syncing"}>
+                        {syncState === "syncing" ? "Connecting…" : "Connect & sync"}
+                      </button>
+                    )}
+                    {gh.gistId && <p className="tr-setnote">Linked gist <b>{gh.gistId.slice(0, 8)}…</b> · token stays only in this browser.</p>}
                   </>
                 )}
-                {gh.gistId ? (
-                  <div className="tr-syncrow">
-                    <span className={`tr-syncstat is-${syncState}`}><i className="tr-syncdot" />{syncLabel}</span>
-                    <button className="tr-databtn" onClick={syncNow} disabled={syncState === "syncing"}>Sync now</button>
-                    <button className="tr-databtn" onClick={disconnectGist}>Disconnect</button>
-                  </div>
-                ) : (
-                  <button className="tr-connect" onClick={connectGist} disabled={syncState === "syncing"}>
-                    {syncState === "syncing" ? "Connecting…" : useProxy ? "Turn on sync" : "Connect & sync"}
-                  </button>
-                )}
                 {syncErr && <p className="tr-datamsg tr-syncerr">{syncErr}</p>}
-                {gh.gistId && <p className="tr-setnote">Linked gist <b>{gh.gistId.slice(0, 8)}…</b>{useProxy ? " · via your proxy." : " · token stays only in this browser."}</p>}
               </section>
 
               <PrivacySection secured={secured} onEnable={enableLock} onDisable={disableLock} onLockNow={lockNow} />
