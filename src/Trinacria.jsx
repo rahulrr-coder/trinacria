@@ -161,6 +161,7 @@ export default function Trinacria() {
   const [aiCfg, setAiCfg] = useState({ provider: "groq", model: PROVIDERS.groq.models[0], remember: false, theme: "auto" });
   const [apiKey, setApiKey] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [emblemOpen, setEmblemOpen] = useState(false);
   const [aiInput, setAiInput] = useState("");
   const [aiOut, setAiOut] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
@@ -428,7 +429,7 @@ export default function Trinacria() {
 
       {/* ---------------- HEADER ---------------- */}
       <header className="tr-head">
-        <Emblem activeStream={weekendView ? null : activeStream} progress={streamPct} />
+        <Emblem activeStream={weekendView ? null : activeStream} progress={streamPct} onOpen={() => setEmblemOpen(true)} />
         <div className="tr-headtext">
           <p className="tr-eyebrow">La giornata in tre movimenti</p>
           <h1 className="tr-title">Trinacria</h1>
@@ -462,6 +463,11 @@ export default function Trinacria() {
             );
           })}
         </div>
+      )}
+
+      {/* ---------------- EMBLEM SHOWCASE ---------------- */}
+      {emblemOpen && (
+        <EmblemShowcase activeStream={weekendView ? null : activeStream} progress={streamPct} onClose={() => setEmblemOpen(false)} />
       )}
 
       {/* ---------------- SETTINGS DRAWER ---------------- */}
@@ -778,12 +784,14 @@ export default function Trinacria() {
 }
 
 /* ---------------- Gilded triskele emblem ---------------- */
-function Emblem({ activeStream, progress = {} }) {
-  const arms = [
-    { ang: 90, stream: "IITM", c: CATS.iitm.color },
-    { ang: 330, stream: "Maersk", c: CATS.maersk.color },
-    { ang: 210, stream: "DeckView", c: CATS.deckview.color },
-  ];
+const EMBLEM_ARMS = [
+  { ang: 90, stream: "IITM", c: CATS.iitm.color, name: CATS.iitm.name },
+  { ang: 330, stream: "Maersk", c: CATS.maersk.color, name: CATS.maersk.name },
+  { ang: 210, stream: "DeckView", c: CATS.deckview.color, name: CATS.deckview.name },
+];
+
+/* The triskele itself — reused at any size by the header button and showcase. */
+function TriskeleArt({ activeStream, progress = {}, size = 64 }) {
   const cx = 50, cy = 50, r = 30, curl = 24;
   const path = (deg) => {
     const a = (deg * Math.PI) / 180;
@@ -794,7 +802,7 @@ function Emblem({ activeStream, progress = {} }) {
     return { d: `M${cx} ${cy} Q ${ccx.toFixed(1)} ${ccy.toFixed(1)} ${ex.toFixed(1)} ${ey.toFixed(1)}`, ex, ey };
   };
   return (
-    <svg className="tr-emblem" viewBox="0 0 100 100" width="64" height="64" aria-hidden="true">
+    <svg className="tr-emblem" viewBox="0 0 100 100" width={size} height={size} aria-hidden="true">
       <defs>
         <radialGradient id="gold" cx="40%" cy="35%" r="75%">
           <stop offset="0%" stopColor="#F0D67A" /><stop offset="55%" stopColor="#C9A227" /><stop offset="100%" stopColor="#8C6D1F" />
@@ -802,7 +810,7 @@ function Emblem({ activeStream, progress = {} }) {
       </defs>
       <circle cx="50" cy="50" r="46" fill="none" stroke="url(#gold)" strokeWidth="1.4" opacity="0.55" />
       <circle cx="50" cy="50" r="40" fill="none" stroke="url(#gold)" strokeWidth="0.7" opacity="0.4" />
-      {arms.map((arm) => {
+      {EMBLEM_ARMS.map((arm) => {
         const p = path(arm.ang);
         const live = activeStream === arm.stream;
         const prog = Math.max(0, Math.min(1, progress[arm.stream] || 0));
@@ -822,6 +830,66 @@ function Emblem({ activeStream, progress = {} }) {
       <circle cx="50" cy="50" r="6.5" fill="url(#gold)" stroke="#8C6D1F" strokeWidth="0.8" />
       <circle cx="48" cy="48" r="2" fill="#FBEFC2" opacity="0.8" />
     </svg>
+  );
+}
+
+/* Header emblem — click to open the showcase. */
+function Emblem({ activeStream, progress, onOpen }) {
+  return (
+    <button className="tr-emblembtn" onClick={onOpen}
+      aria-label="Open the triskele" title="Play with the triskele ✦">
+      <TriskeleArt activeStream={activeStream} progress={progress} size={64} />
+    </button>
+  );
+}
+
+/* Fullscreen showcase: spins in on open, fills its arms by progress, drag to spin. */
+function EmblemShowcase({ activeStream, progress = {}, onClose }) {
+  const [rot, setRot] = useState(-200);     // start off-angle so it spins into place
+  const [dragging, setDragging] = useState(false);
+  const drag = useRef(null);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setRot(0));     // animate to rest
+    const esc = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", esc);
+    return () => { cancelAnimationFrame(id); window.removeEventListener("keydown", esc); };
+  }, [onClose]);
+
+  const angleAt = (e) => {
+    const b = ref.current?.getBoundingClientRect();
+    if (!b) return 0;
+    return (Math.atan2(e.clientY - (b.top + b.height / 2), e.clientX - (b.left + b.width / 2)) * 180) / Math.PI;
+  };
+  const onDown = (e) => { setDragging(true); drag.current = { a: angleAt(e), r: rot }; e.currentTarget.setPointerCapture?.(e.pointerId); };
+  const onMove = (e) => { if (drag.current) setRot(drag.current.r + (angleAt(e) - drag.current.a)); };
+  const onUp = () => { setDragging(false); drag.current = null; };
+
+  return (
+    <div className="tr-emblemscrim" onClick={onClose}>
+      <div className="tr-emblemstage" role="dialog" aria-modal="true" aria-label="Triskele" onClick={(e) => e.stopPropagation()}>
+        <button className="tr-modalclose tr-emblemx" onClick={onClose} aria-label="Close">✕</button>
+        <div ref={ref} className={`tr-emblemspin ${dragging ? "drag" : ""}`}
+          onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}
+          style={{ transform: `rotate(${rot}deg)`, transition: dragging ? "none" : "transform 1s cubic-bezier(.2,.85,.25,1)" }}>
+          <TriskeleArt activeStream={activeStream} progress={progress} size={300} />
+        </div>
+        <p className="tr-emblemhint">drag to spin · ogni braccio si accende coi tuoi progressi</p>
+        <div className="tr-emblemlegend">
+          {EMBLEM_ARMS.map((a) => {
+            const pct = Math.round(Math.max(0, Math.min(1, progress[a.stream] || 0)) * 100);
+            return (
+              <div key={a.stream} className={`tr-emblemleg ${activeStream === a.stream ? "live" : ""}`}>
+                <span className="tr-emblemdot" style={{ background: a.c }} />
+                <span className="tr-emblemname">{a.name}</span>
+                <span className="tr-emblempct">{pct}%</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
   );
 }
 
