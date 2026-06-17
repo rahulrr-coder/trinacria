@@ -137,7 +137,8 @@ async function askAI({ provider, apiKey, model, system, user }) {
     ? await fetch(`${PROXY}/api/ai`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(PROXY_SECRET ? { "X-App-Secret": PROXY_SECRET } : {}) },
-        body: JSON.stringify({ provider, model, system, user }),
+        // provider/model are owned by the proxy — the browser doesn't send them
+        body: JSON.stringify({ system, user }),
       })
     : await fetch(PROVIDERS[provider].url, {
         method: "POST",
@@ -308,7 +309,9 @@ export default function Trinacria() {
 
   /* ---- multi-device sync (proxy or direct gist) ---- */
   const connOf = (token) => ({ token, proxy: PROXY, secret: PROXY_SECRET });
-  const canSync = (token, gistId) => !!gistId && (useProxy || !!token);
+  // Proxy mode: the Worker owns the gist, so sync is always on. Direct mode
+  // (no proxy) still needs a token + a gist id the user supplied.
+  const canSync = () => useProxy || (!!gh.token && !!gh.gistId);
   // Stable signature of the *shared* payload (excludes the volatile exportedAt
   // timestamp). Used to skip no-op syncs and break the self-trigger loop that
   // otherwise hammered GitHub into a 403 rate-limit.
@@ -332,7 +335,7 @@ export default function Trinacria() {
   };
   const syncNow = async () => {
     const { token, gistId } = gh;
-    if (!canSync(token, gistId)) return;
+    if (!canSync()) return;
     if (syncingRef.current || locked) return;
     syncingRef.current = true;
     setSyncState("syncing"); setSyncErr("");
@@ -406,7 +409,7 @@ export default function Trinacria() {
       const vault = await sGet(K_VAULT);
       if (isEnvelope(vault)) { try { applySnap(await decryptJSON(key, vault)); } catch { /* corrupt */ } }
       setSecured(true); setLocked(false); pendingEnvRef.current = null;
-      if (canSync(gh.token, gh.gistId)) syncRef.current();
+      if (canSync()) syncRef.current();
       return null;
     }
     // No local vault, but a synced gist arrived encrypted -> adopt it here.
@@ -438,7 +441,7 @@ export default function Trinacria() {
     await Promise.all([sDel(K_T), sDel(K_L), sDel(K_AI)]);
     cryptoRef.current = { key, salt, password };
     setSecured(true); setLocked(false);
-    if (canSync(gh.token, gh.gistId)) syncRef.current();   // re-push encrypted
+    if (canSync()) syncRef.current();   // re-push encrypted
     return null;
   };
   // Turn encryption off — write plaintext back and re-push it.
@@ -448,7 +451,7 @@ export default function Trinacria() {
     await Promise.all([sDel(K_SEC), sDel(K_VAULT)]);
     cryptoRef.current = { key: null, salt: null, password: null };
     setSecured(false); setLocked(false);
-    if (canSync(gh.token, gh.gistId)) setTimeout(() => syncRef.current(), 0);
+    if (canSync()) setTimeout(() => syncRef.current(), 0);
   };
   // Quick re-lock (shared device) without removing encryption.
   const lockNow = () => {
@@ -456,23 +459,24 @@ export default function Trinacria() {
     setLocked(true); setSettingsOpen(false);
   };
 
-  // pull + merge once we're connected (covers boot and the moment of connecting)
+  const syncReady = useProxy || (!!gh.token && !!gh.gistId);
+  // pull + merge once we're ready (covers boot and the moment of connecting)
   useEffect(() => {
-    if (loaded && canSync(gh.token, gh.gistId)) syncRef.current();
-  }, [loaded, gh.token, gh.gistId]);
-  // debounced push whenever data *actually* changes while connected.
+    if (loaded && syncReady) syncRef.current();
+  }, [loaded, syncReady]);
+  // debounced push whenever data *actually* changes while ready.
   // The signature check is what stops a sync-induced re-render from
   // rescheduling another sync forever.
   useEffect(() => {
-    if (!loaded || !canSync(gh.token, gh.gistId)) return;
+    if (!loaded || !syncReady) return;
     if (sigOf(snapshotOf(stateRef.current)) === lastSyncedSig.current) return;
     const id = setTimeout(() => syncRef.current(), 6000);
     return () => clearTimeout(id);
-  }, [templates, logs, loaded, gh.token, gh.gistId]);
+  }, [templates, logs, loaded, syncReady]);
   const syncLabel = syncState === "syncing" ? "syncing…"
     : syncState === "error" ? "sync error"
-    : gh.gistId ? (gh.lastSync ? `synced ${new Date(gh.lastSync).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "connected")
-    : "not connected";
+    : gh.lastSync ? `synced ${new Date(gh.lastSync).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+    : syncReady ? "connected" : "not connected";
 
   /* ---- reminders: nudge when a block becomes "now" (app open) ---- */
   const notify = !!aiCfg.notify;
@@ -623,25 +627,25 @@ export default function Trinacria() {
 
               <section className="tr-section">
                 <h3 className="tr-sectitle">Il Consigliere · AI</h3>
-                <div className="tr-setrow">
-                  <span className="tr-setlabel">Provider</span>
-                  <div className="tr-provsel">
-                    {Object.keys(PROVIDERS).map((k) => (
-                      <button key={k} className={`tr-prov ${aiCfg.provider === k ? "on" : ""}`}
-                        onClick={() => setAiCfg((p) => ({ ...p, provider: k, model: PROVIDERS[k].models[0] }))}>{PROVIDERS[k].name}</button>
-                    ))}
-                  </div>
-                </div>
-                <div className="tr-setrow">
-                  <span className="tr-setlabel">Model</span>
-                  <select className="tr-modelsel" value={aiCfg.model} onChange={(e) => setAiCfg((p) => ({ ...p, model: e.target.value }))}>
-                    {PROVIDERS[aiCfg.provider].models.map((m) => <option key={m} value={m}>{m}</option>)}
-                  </select>
-                </div>
                 {useProxy ? (
-                  <p className="tr-setnote">🔒 Keys are held by your secure proxy — nothing to enter here.</p>
+                  <p className="tr-setnote">🔒 Your consigliere runs on <b>Groq</b> through your secure proxy — the key and model are handled server-side, nothing to set here.</p>
                 ) : (
                   <>
+                    <div className="tr-setrow">
+                      <span className="tr-setlabel">Provider</span>
+                      <div className="tr-provsel">
+                        {Object.keys(PROVIDERS).map((k) => (
+                          <button key={k} className={`tr-prov ${aiCfg.provider === k ? "on" : ""}`}
+                            onClick={() => setAiCfg((p) => ({ ...p, provider: k, model: PROVIDERS[k].models[0] }))}>{PROVIDERS[k].name}</button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="tr-setrow">
+                      <span className="tr-setlabel">Model</span>
+                      <select className="tr-modelsel" value={aiCfg.model} onChange={(e) => setAiCfg((p) => ({ ...p, model: e.target.value }))}>
+                        {PROVIDERS[aiCfg.provider].models.map((m) => <option key={m} value={m}>{m}</option>)}
+                      </select>
+                    </div>
                     <div className="tr-setrow">
                       <span className="tr-setlabel">API key</span>
                       <input className="tr-keyinput" type="password" value={apiKey} placeholder={PROVIDERS[aiCfg.provider].keyHint}
@@ -659,7 +663,10 @@ export default function Trinacria() {
               <section className="tr-section">
                 <h3 className="tr-sectitle">Sync · across devices</h3>
                 {useProxy ? (
-                  <p className="tr-setnote">🔒 Synced through your secure proxy — no token needed. Just turn it on.</p>
+                  <>
+                    <p className="tr-setnote">🔒 Synced automatically across your devices through your secure proxy — nothing to set up.</p>
+                    <span className={`tr-syncstat is-${syncState}`}><i className="tr-syncdot" />{syncLabel}</span>
+                  </>
                 ) : (
                   <>
                     <p className="tr-setnote">Keep your day in step on phone and laptop through a <b>private GitHub gist</b>. Use a token with <b>only the gist scope</b>.</p>
@@ -668,21 +675,21 @@ export default function Trinacria() {
                       <input className="tr-keyinput" type="password" value={ghToken} placeholder="github_pat_… / ghp_…"
                         onChange={(e) => setGhToken(e.target.value)} />
                     </div>
+                    {gh.gistId ? (
+                      <div className="tr-syncrow">
+                        <span className={`tr-syncstat is-${syncState}`}><i className="tr-syncdot" />{syncLabel}</span>
+                        <button className="tr-databtn" onClick={syncNow} disabled={syncState === "syncing"}>Sync now</button>
+                        <button className="tr-databtn" onClick={disconnectGist}>Disconnect</button>
+                      </div>
+                    ) : (
+                      <button className="tr-connect" onClick={connectGist} disabled={syncState === "syncing"}>
+                        {syncState === "syncing" ? "Connecting…" : "Connect & sync"}
+                      </button>
+                    )}
+                    {gh.gistId && <p className="tr-setnote">Linked gist <b>{gh.gistId.slice(0, 8)}…</b> · token stays only in this browser.</p>}
                   </>
                 )}
-                {gh.gistId ? (
-                  <div className="tr-syncrow">
-                    <span className={`tr-syncstat is-${syncState}`}><i className="tr-syncdot" />{syncLabel}</span>
-                    <button className="tr-databtn" onClick={syncNow} disabled={syncState === "syncing"}>Sync now</button>
-                    <button className="tr-databtn" onClick={disconnectGist}>Disconnect</button>
-                  </div>
-                ) : (
-                  <button className="tr-connect" onClick={connectGist} disabled={syncState === "syncing"}>
-                    {syncState === "syncing" ? "Connecting…" : useProxy ? "Turn on sync" : "Connect & sync"}
-                  </button>
-                )}
                 {syncErr && <p className="tr-datamsg tr-syncerr">{syncErr}</p>}
-                {gh.gistId && <p className="tr-setnote">Linked gist <b>{gh.gistId.slice(0, 8)}…</b>{useProxy ? " · via your proxy." : " · token stays only in this browser."}</p>}
               </section>
 
               <PrivacySection secured={secured} onEnable={enableLock} onDisable={disableLock} onLockNow={lockNow} />
@@ -915,45 +922,72 @@ const EMBLEM_ARMS = [
   { ang: 210, stream: "DeckView", c: CATS.deckview.color, name: CATS.deckview.name },
 ];
 
-/* The triskele itself — reused at any size by the header button and showcase. */
+/* The Trinacria proper — a Gorgon (Medusa) head with snake hair at the hub and
+   three bent running legs, each lit by its stream's progress. Reused at any size
+   by the header button and the showcase. */
 function TriskeleArt({ activeStream, progress = {}, size = 64 }) {
-  const cx = 50, cy = 50, r = 30, curl = 24;
-  const path = (deg) => {
-    const a = (deg * Math.PI) / 180;
-    const ex = cx + r * Math.cos(a), ey = cy - r * Math.sin(a);
-    const mx = cx + r * 0.5 * Math.cos(a), my = cy - r * 0.5 * Math.sin(a);
-    const pa = a + Math.PI / 2;
-    const ccx = mx + curl * Math.cos(pa), ccy = my - curl * Math.sin(pa);
-    return { d: `M${cx} ${cy} Q ${ccx.toFixed(1)} ${ccy.toFixed(1)} ${ex.toFixed(1)} ${ey.toFixed(1)}`, ex, ey };
-  };
+  const C = 50;
+  // one bent leg pointing up, knee bending clockwise; rotated 120° for the trio
+  const LEG = "M50 50 L50 30 Q50 23 57 21.8 L71 18.5";
+  // a writhing halo of little snakes around the head
+  const snakes = Array.from({ length: 12 }, (_, i) => {
+    const a = ((i * 30 - 90) * Math.PI) / 180;
+    const r0 = 11, r1 = 18.5;
+    const ta = a + Math.PI / 2;
+    const mx = C + ((r0 + r1) / 2) * Math.cos(a) + 3.4 * Math.cos(ta);
+    const my = C + ((r0 + r1) / 2) * Math.sin(a) + 3.4 * Math.sin(ta);
+    const x0 = C + r0 * Math.cos(a), y0 = C + r0 * Math.sin(a);
+    const x1 = C + r1 * Math.cos(a), y1 = C + r1 * Math.sin(a);
+    return { d: `M${x0.toFixed(1)} ${y0.toFixed(1)} Q ${mx.toFixed(1)} ${my.toFixed(1)} ${x1.toFixed(1)} ${y1.toFixed(1)}`, hx: x1, hy: y1 };
+  });
   return (
     <svg className="tr-emblem" viewBox="0 0 100 100" width={size} height={size} aria-hidden="true">
       <defs>
         <radialGradient id="gold" cx="40%" cy="35%" r="75%">
           <stop offset="0%" stopColor="#F0D67A" /><stop offset="55%" stopColor="#C9A227" /><stop offset="100%" stopColor="#8C6D1F" />
         </radialGradient>
+        <radialGradient id="face" cx="42%" cy="36%" r="72%">
+          <stop offset="0%" stopColor="#FCEBB0" /><stop offset="58%" stopColor="#E6C766" /><stop offset="100%" stopColor="#B8912F" />
+        </radialGradient>
       </defs>
       <circle cx="50" cy="50" r="46" fill="none" stroke="url(#gold)" strokeWidth="1.4" opacity="0.55" />
       <circle cx="50" cy="50" r="40" fill="none" stroke="url(#gold)" strokeWidth="0.7" opacity="0.4" />
-      {EMBLEM_ARMS.map((arm) => {
-        const p = path(arm.ang);
+
+      {/* three bent legs (drawn first; the head overlaps their hubs) */}
+      {EMBLEM_ARMS.map((arm, i) => {
         const live = activeStream === arm.stream;
         const prog = Math.max(0, Math.min(1, progress[arm.stream] || 0));
         return (
-          <g key={arm.stream} className={live ? "tr-armlive" : ""} style={live ? { color: arm.c } : undefined}>
-            {/* faint gold base — the unlit arm */}
-            <path d={p.d} fill="none" stroke="url(#gold)" strokeWidth="3.4" strokeLinecap="round" opacity="0.45" />
-            {/* coloured overlay reveals as that stream's blocks get done */}
-            <path d={p.d} fill="none" stroke={arm.c} strokeWidth="3.4" strokeLinecap="round"
+          <g key={arm.stream} transform={`rotate(${i * 120} 50 50)`} className={live ? "tr-armlive" : ""} style={live ? { color: arm.c } : undefined}>
+            <path d={LEG} fill="none" stroke="url(#gold)" strokeWidth="6.6" strokeLinecap="round" strokeLinejoin="round" opacity="0.5" />
+            <path d={LEG} fill="none" stroke={arm.c} strokeWidth="6.6" strokeLinecap="round" strokeLinejoin="round"
               pathLength="1" style={{ strokeDasharray: 1, strokeDashoffset: 1 - prog, transition: "stroke-dashoffset .6s ease" }} />
-            <circle cx={p.ex} cy={p.ey} r={live ? 7.5 : 6} fill={arm.c} fillOpacity={0.3 + 0.7 * prog}
-              stroke="url(#gold)" strokeWidth="1.6" />
-            {live && <circle cx={p.ex} cy={p.ey} r="6" fill="none" stroke={arm.c} strokeWidth="1.4" className="tr-armring" />}
+            {/* foot */}
+            <ellipse cx="71" cy="18.5" rx="6.2" ry="3.3" transform="rotate(-14 71 18.5)"
+              fill={arm.c} fillOpacity={0.35 + 0.65 * prog} stroke="url(#gold)" strokeWidth="1.4" />
+            {live && <circle cx="71" cy="18.5" r="7" fill="none" stroke={arm.c} strokeWidth="1.4" className="tr-armring" />}
           </g>
         );
       })}
-      <circle cx="50" cy="50" r="6.5" fill="url(#gold)" stroke="#8C6D1F" strokeWidth="0.8" />
-      <circle cx="48" cy="48" r="2" fill="#FBEFC2" opacity="0.8" />
+
+      {/* Gorgon head */}
+      <g>
+        {snakes.map((s, i) => (
+          <g key={i}>
+            <path d={s.d} fill="none" stroke="url(#gold)" strokeWidth="2.1" strokeLinecap="round" opacity="0.9" />
+            <circle cx={s.hx} cy={s.hy} r="1.6" fill="url(#gold)" />
+          </g>
+        ))}
+        <circle cx="50" cy="50" r="12" fill="url(#face)" stroke="url(#gold)" strokeWidth="1.4" />
+        {/* brows + eyes */}
+        <path d="M43.2 45.6 Q45.6 44.1 48.2 45.6" stroke="#7A5E22" strokeWidth="1" fill="none" strokeLinecap="round" />
+        <path d="M51.8 45.6 Q54.4 44.1 56.8 45.6" stroke="#7A5E22" strokeWidth="1" fill="none" strokeLinecap="round" />
+        <ellipse cx="45.7" cy="49" rx="1.7" ry="2.3" fill="#3A2A12" />
+        <ellipse cx="54.3" cy="49" rx="1.7" ry="2.3" fill="#3A2A12" />
+        {/* nose + mouth */}
+        <path d="M50 49.6 L48.9 53.4 Q50 54.3 51.1 53.4" stroke="#7A5E22" strokeWidth="1" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M46.8 56.6 Q50 58.2 53.2 56.6" stroke="#7A5E22" strokeWidth="1.1" fill="none" strokeLinecap="round" />
+      </g>
     </svg>
   );
 }
