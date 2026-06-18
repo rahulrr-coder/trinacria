@@ -162,7 +162,7 @@ export default function Trinacria() {
   const [openNote, setOpenNote] = useState(null);
 
   // AI state
-  const [aiCfg, setAiCfg] = useState({ provider: "groq", model: PROVIDERS.groq.models[0], remember: false, theme: "auto" });
+  const [aiCfg, setAiCfg] = useState({ provider: "groq", model: PROVIDERS.groq.models[0], remember: false, theme: "auto", zoom: 1 });
   const [apiKey, setApiKey] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [emblemOpen, setEmblemOpen] = useState(false);
@@ -245,6 +245,27 @@ export default function Trinacria() {
 
   // time-of-day theming: phase from the device clock, with a manual override
   const themeMode = aiCfg.theme || "auto"; // auto | light | notte
+  // In-app zoom — the desktop-wrapped PWA gives no browser zoom of its own, so we
+  // scale the whole interface ourselves. Persists & syncs with the rest of config.
+  const zoom = aiCfg.zoom || 1;
+  const ZMIN = 0.8, ZMAX = 1.6, ZSTEP = 0.1;
+  const adjustZoom = (dir) => setAiCfg((p) => {
+    const next = Math.min(ZMAX, Math.max(ZMIN, Math.round(((p.zoom || 1) + dir * ZSTEP) * 100) / 100));
+    return { ...p, zoom: next };
+  });
+  useEffect(() => { document.documentElement.style.zoom = String(zoom); }, [zoom]);
+  // Ctrl/⌘ +/-/0 — the desktop wrapper swallows the browser's own zoom keys, so
+  // we honour them ourselves.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === "=" || e.key === "+") { e.preventDefault(); adjustZoom(1); }
+      else if (e.key === "-") { e.preventDefault(); adjustZoom(-1); }
+      else if (e.key === "0") { e.preventDefault(); setAiCfg((p) => ({ ...p, zoom: 1 })); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   const hr = now.getHours();
   const phase = hr < 5 ? "notte" : hr < 11 ? "alba" : hr < 17 ? "giorno" : hr < 21 ? "sera" : "notte";
   const appearance = themeMode === "notte" ? "dark" : themeMode === "light" ? "light" : (phase === "notte" ? "dark" : "light");
@@ -507,7 +528,7 @@ export default function Trinacria() {
     }).join("\n");
     return `Day: ${onToday ? "today" : dayLabel(viewDate)} (${weekendView ? "weekend" : "weekday"}).\nPlan:\n${lines}\nReflection so far: ${log.reflection || "(none)"}`;
   };
-  const SYSTEM = "You are Il Consigliere, Rahul's trusted advisor inside his daily planner. His model: a sliding window of three streams in fixed order — IITM (study, morning), Maersk (work, day), DeckView (his SaaS, night) — with intensity that flexes. DSA is one problem a day inside Maersk dead-time. Be direct, warm, brief. No flattery, no hedging. Use short clear sections with bold subheadings only when it genuinely helps. Push back when his plan is unrealistic. Keep it under ~180 words unless asked for more.";
+  const SYSTEM = "You are Il Consigliere, Rahul's trusted advisor inside his daily planner. His model: a sliding window of three streams in fixed order — IITM (study, morning), Maersk (work, day), DeckView (his SaaS, night) — with intensity that flexes. DSA is one problem a day inside Maersk dead-time. Be warm, calm, and encouraging — a steady ally, not a taskmaster. The order is a rhythm to return to, not a cage: some days a stream gets nothing, and that's fine — progress is cumulative, not daily. Help him choose what matters today and let the rest wait without guilt. Be honest and clear, gently surface when a plan is overloaded, and offer the lighter version. No flattery, no shame, no hustle-talk. Use short clear sections with bold subheadings only when it genuinely helps. Keep it under ~180 words unless asked for more.";
 
   const runAI = async (userMsg) => {
     if (!useProxy && !apiKey.trim()) { setSettingsOpen(true); setAiErr("Add a key to wake your consigliere."); return; }
@@ -534,7 +555,7 @@ export default function Trinacria() {
     try {
       const out = await askAI({
         provider: aiCfg.provider, apiKey: apiKey.trim(), model: aiCfg.model,
-        system: "You are Il Consigliere. Write ONE short opening line for Rahul's day — a single sentence under 14 words, a focused intention in your warm, direct voice. No quotes, no preamble, no emoji.",
+        system: "You are Il Consigliere. Write ONE short opening line for Rahul's day — a single sentence under 14 words, a calm, encouraging intention in your warm voice. Invite, don't command. No quotes, no preamble, no emoji.",
         user: buildContext(),
       });
       const line = out.split("\n")[0].replace(/^["“'']+|["”'']+$/g, "").trim();
@@ -560,6 +581,14 @@ export default function Trinacria() {
           <p className="tr-sub">Your day in three movements — study, work, the thing you’re building. The order holds; the intensity bends.</p>
         </div>
         <div className="tr-headbtns">
+          <div className="tr-zoom" role="group" aria-label="Zoom">
+            <button className="tr-zbtn" onClick={() => adjustZoom(-1)} disabled={zoom <= ZMIN}
+              aria-label="Zoom out" title="Zoom out">−</button>
+            <button className="tr-zlbl" onClick={() => setAiCfg((p) => ({ ...p, zoom: 1 }))}
+              aria-label="Reset zoom" title="Reset zoom">{Math.round(zoom * 100)}%</button>
+            <button className="tr-zbtn" onClick={() => adjustZoom(1)} disabled={zoom >= ZMAX}
+              aria-label="Zoom in" title="Zoom in">+</button>
+          </div>
           <button className="tr-theme" onClick={() => setAiCfg((p) => ({ ...p, theme: THEME_CYCLE[themeMode] }))}
             aria-label="Cycle appearance" title={`Appearance: ${THEME_NAME[themeMode]}`}>{THEME_ICON[themeMode]}</button>
           <button className="tr-gear" onClick={() => setSettingsOpen((v) => !v)} aria-label="AI settings" title="Consigliere settings">✦</button>
@@ -859,9 +888,9 @@ export default function Trinacria() {
             </div>
 
             <div className="tr-chips">
-              <button className="tr-chip" onClick={() => runAI("Sequence my day and name the one thing to protect today.")}>Plan today</button>
-              <button className="tr-chip" onClick={() => runAI("Based on today, what exactly should I pre-load tonight for tomorrow’s first IITM and DeckView blocks?")}>Pre-load tonight</button>
-              <button className="tr-chip" onClick={() => runAI("Here’s what I did today. Give me one honest, useful reflection — no flattery.")}>Reflect</button>
+              <button className="tr-chip" onClick={() => runAI("Help me ease into today. What's the one thing worth protecting, and what can wait without guilt?")}>Plan today</button>
+              <button className="tr-chip" onClick={() => runAI("Looking at today, what would be a gentle thing to pre-load tonight for tomorrow's first IITM and DeckView blocks? Keep it light.")}>Pre-load tonight</button>
+              <button className="tr-chip" onClick={() => runAI("Here's how today went. Give me one kind, honest reflection — name what went well, and one small nudge, no shame.")}>Reflect</button>
             </div>
 
             <div className="tr-askrow">
@@ -929,16 +958,35 @@ function TriskeleArt({ activeStream, progress = {}, size = 64 }) {
   const C = 50;
   // one bent leg pointing up, knee bending clockwise; rotated 120° for the trio
   const LEG = "M50 50 L50 30 Q50 23 57 21.8 L71 18.5";
-  // a writhing halo of little snakes around the head
-  const snakes = Array.from({ length: 12 }, (_, i) => {
-    const a = ((i * 30 - 90) * Math.PI) / 180;
-    const r0 = 11, r1 = 18.5;
-    const ta = a + Math.PI / 2;
-    const mx = C + ((r0 + r1) / 2) * Math.cos(a) + 3.4 * Math.cos(ta);
-    const my = C + ((r0 + r1) / 2) * Math.sin(a) + 3.4 * Math.sin(ta);
+  // a writhing nest of serpents. Each one veers tangentially (it does not shoot
+  // straight out) and ends in a little curled head, so the halo reads as Medusa's
+  // snaking hair rather than an even sunburst. All deterministic from the index.
+  const N = 8;
+  const snakes = Array.from({ length: N }, (_, i) => {
+    const f = (m, lo, hi) => lo + ((i * m) % (hi - lo + 1));  // cheap deterministic spread
+    const baseDeg = -90 + i * (360 / N) + (f(37, 0, 22) - 11); // uneven base angles
+    const a = (baseDeg * Math.PI) / 180;
+    const dir = i % 2 ? 1 : -1;                                // alternate the curl side
+    const r0 = 10.4;
+    const len = 7 + f(5, 0, 9) + (i % 3) * 1.6;               // 7–17: long tendrils and short coils
+    const sweep = dir * (0.34 + f(13, 0, 5) * 0.04);          // tangential veer of the whole strand
+    const aEnd = a + sweep;
+    const r1 = r0 + len;
     const x0 = C + r0 * Math.cos(a), y0 = C + r0 * Math.sin(a);
-    const x1 = C + r1 * Math.cos(a), y1 = C + r1 * Math.sin(a);
-    return { d: `M${x0.toFixed(1)} ${y0.toFixed(1)} Q ${mx.toFixed(1)} ${my.toFixed(1)} ${x1.toFixed(1)} ${y1.toFixed(1)}`, hx: x1, hy: y1 };
+    const ex = C + r1 * Math.cos(aEnd), ey = C + r1 * Math.sin(aEnd);
+    // two control points pull the body to one side then the other (an S)
+    const mid = (t, off, ang) => [
+      C + (r0 + len * t) * Math.cos(a + sweep * t) + off * Math.cos(a + sweep * t + Math.PI / 2),
+      C + (r0 + len * t) * Math.sin(a + sweep * t) + off * Math.sin(a + sweep * t + Math.PI / 2),
+    ];
+    const c1 = mid(0.34, dir * (3.4 + f(3, 0, 3))), c2 = mid(0.68, -dir * (2.2 + f(2, 0, 2)));
+    // a curled hook at the very tip so the strand finishes like a snake's head
+    const hook = dir * (2.4 + f(2, 0, 2));
+    const hx = ex + hook * Math.cos(aEnd + Math.PI / 2), hy = ey + hook * Math.sin(aEnd + Math.PI / 2);
+    return {
+      d: `M${x0.toFixed(1)} ${y0.toFixed(1)} C ${c1[0].toFixed(1)} ${c1[1].toFixed(1)} ${c2[0].toFixed(1)} ${c2[1].toFixed(1)} ${ex.toFixed(1)} ${ey.toFixed(1)} Q ${(ex + (ex - c2[0]) * 0.3).toFixed(1)} ${(ey + (ey - c2[1]) * 0.3).toFixed(1)} ${hx.toFixed(1)} ${hy.toFixed(1)}`,
+      hx, hy, w: 2.5 - (i % 3) * 0.4,                          // tapering coil weights
+    };
   });
   return (
     <svg className="tr-emblem" viewBox="0 0 100 100" width={size} height={size} aria-hidden="true">
@@ -972,21 +1020,28 @@ function TriskeleArt({ activeStream, progress = {}, size = 64 }) {
 
       {/* Gorgon head */}
       <g>
+        {/* serpents: a darker under-stroke gives each coil body and depth */}
         {snakes.map((s, i) => (
           <g key={i}>
-            <path d={s.d} fill="none" stroke="url(#gold)" strokeWidth="2.1" strokeLinecap="round" opacity="0.9" />
-            <circle cx={s.hx} cy={s.hy} r="1.6" fill="url(#gold)" />
+            <path d={s.d} fill="none" stroke="#5C460F" strokeWidth={s.w + 1.5} strokeLinecap="round" opacity="0.45" />
+            <path d={s.d} fill="none" stroke="url(#gold)" strokeWidth={s.w} strokeLinecap="round" opacity="0.95" />
+            <circle cx={s.hx} cy={s.hy} r="1.5" fill="url(#face)" stroke="#5C460F" strokeWidth="0.4" />
           </g>
         ))}
         <circle cx="50" cy="50" r="12" fill="url(#face)" stroke="url(#gold)" strokeWidth="1.4" />
-        {/* brows + eyes */}
-        <path d="M43.2 45.6 Q45.6 44.1 48.2 45.6" stroke="#7A5E22" strokeWidth="1" fill="none" strokeLinecap="round" />
-        <path d="M51.8 45.6 Q54.4 44.1 56.8 45.6" stroke="#7A5E22" strokeWidth="1" fill="none" strokeLinecap="round" />
-        <ellipse cx="45.7" cy="49" rx="1.7" ry="2.3" fill="#3A2A12" />
-        <ellipse cx="54.3" cy="49" rx="1.7" ry="2.3" fill="#3A2A12" />
-        {/* nose + mouth */}
-        <path d="M50 49.6 L48.9 53.4 Q50 54.3 51.1 53.4" stroke="#7A5E22" strokeWidth="1" fill="none" strokeLinecap="round" strokeLinejoin="round" />
-        <path d="M46.8 56.6 Q50 58.2 53.2 56.6" stroke="#7A5E22" strokeWidth="1.1" fill="none" strokeLinecap="round" />
+        {/* lower-face shadow crescent for depth */}
+        <path d="M39 51 A 12 12 0 0 0 61 51 A 14 16 0 0 1 39 51 Z" fill="#7A5E22" opacity="0.22" />
+        {/* furrowed brows angled down toward the nose — a fierce, solemn glare */}
+        <path d="M42.6 45 L48.4 47" stroke="#5C460F" strokeWidth="1.3" fill="none" strokeLinecap="round" />
+        <path d="M57.4 45 L51.6 47" stroke="#5C460F" strokeWidth="1.3" fill="none" strokeLinecap="round" />
+        {/* narrowed almond eyes with pupils */}
+        <path d="M43.4 49.3 Q45.7 47.7 48 49.3 Q45.7 50.5 43.4 49.3 Z" fill="#FBEFC6" stroke="#5C460F" strokeWidth="0.5" />
+        <path d="M52 49.3 Q54.3 47.7 56.6 49.3 Q54.3 50.5 52 49.3 Z" fill="#FBEFC6" stroke="#5C460F" strokeWidth="0.5" />
+        <circle cx="45.7" cy="49.1" r="1.05" fill="#2A1D0A" />
+        <circle cx="54.3" cy="49.1" r="1.05" fill="#2A1D0A" />
+        {/* nose + a set, unsmiling mouth */}
+        <path d="M50 50 L48.7 53.6 Q50 54.6 51.3 53.6" stroke="#7A5E22" strokeWidth="1" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M46.4 56.4 Q50 57.4 53.6 56.4" stroke="#5C460F" strokeWidth="1.2" fill="none" strokeLinecap="round" />
       </g>
     </svg>
   );
@@ -1086,7 +1141,7 @@ function Emblem({ activeStream, progress, onOpen }) {
   return (
     <button className="tr-emblembtn" onClick={onOpen}
       aria-label="Open the triskele" title="Play with the triskele ✦">
-      <TriskeleArt activeStream={activeStream} progress={progress} size={64} />
+      <TriskeleArt activeStream={activeStream} progress={progress} size={78} />
     </button>
   );
 }
