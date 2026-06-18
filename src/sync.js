@@ -51,10 +51,11 @@ export async function createGist(conn, snapshot) {
   return (await res.json()).id;
 }
 
-/* Read the snapshot back out of a gist. */
+/* Read the snapshot back out of a gist. The proxy owns the gist id, so in
+   proxy mode we don't pass one. */
 export async function pullGist(conn, gistId) {
   if (conn.proxy) {
-    const res = await ok(await fetch(`${conn.proxy}/api/sync?gist=${encodeURIComponent(gistId)}`, { headers: proxyHeaders(conn) }));
+    const res = await ok(await fetch(`${conn.proxy}/api/sync`, { headers: proxyHeaders(conn) }));
     try { return JSON.parse(await res.text()); } catch { throw new Error("Proxy returned invalid JSON."); }
   }
   const res = await ok(await fetch(`${API}/gists/${gistId}`, { headers: ghHeaders(conn.token) }));
@@ -69,7 +70,7 @@ export async function pullGist(conn, gistId) {
 /* Overwrite the gist with a new snapshot. */
 export async function pushGist(conn, gistId, snapshot) {
   if (conn.proxy) {
-    await ok(await fetch(`${conn.proxy}/api/sync?gist=${encodeURIComponent(gistId)}`, {
+    await ok(await fetch(`${conn.proxy}/api/sync`, {
       method: "PUT", headers: proxyHeaders(conn), body: JSON.stringify(snapshot),
     }));
     return;

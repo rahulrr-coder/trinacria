@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { createGist, pullGist, pushGist, mergeState } from "./sync.js";
+import { cryptoReady, isEnvelope, randomSalt, deriveKey, encryptJSON, decryptJSON, VERIFIER } from "./crypto.js";
 import "./trinacria.css";
 
 /* Optional secure proxy (a Cloudflare Worker holding the real secrets).
@@ -104,6 +105,8 @@ const K_L = "trinacria_logs_v1";
 const K_AI = "trinacria_ai_v1";
 const K_KEY = "trinacria_aikey_v1";
 const K_GH = "trinacria_gh_v1";
+const K_SEC = "trinacria_sec_v1";     // { salt, check } — present iff encryption is on
+const K_VAULT = "trinacria_vault_v1"; // encrypted snapshot envelope (replaces K_T/K_L/K_AI)
 
 /* a single portable snapshot of everything worth keeping — used by
  * both file export/import and gist sync, so they never drift apart. */
@@ -134,7 +137,8 @@ async function askAI({ provider, apiKey, model, system, user }) {
     ? await fetch(`${PROXY}/api/ai`, {
         method: "POST",
         headers: { "Content-Type": "application/json", ...(PROXY_SECRET ? { "X-App-Secret": PROXY_SECRET } : {}) },
-        body: JSON.stringify({ provider, model, system, user }),
+        // provider/model are owned by the proxy — the browser doesn't send them
+        body: JSON.stringify({ system, user }),
       })
     : await fetch(PROVIDERS[provider].url, {
         method: "POST",
@@ -158,9 +162,15 @@ export default function Trinacria() {
   const [openNote, setOpenNote] = useState(null);
 
   // AI state
-  const [aiCfg, setAiCfg] = useState({ provider: "groq", model: PROVIDERS.groq.models[0], remember: false, theme: "auto" });
+  const [aiCfg, setAiCfg] = useState({ provider: "groq", model: PROVIDERS.groq.models[0], remember: false, theme: "auto", zoom: 1 });
   const [apiKey, setApiKey] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [emblemOpen, setEmblemOpen] = useState(false);
+  // ---- at-rest encryption (one password) ----
+  const [secured, setSecured] = useState(false);   // encryption enabled on this device
+  const [locked, setLocked] = useState(false);     // needs password before data is usable
+  const cryptoRef = useRef({ key: null, salt: null, password: null });
+  const pendingEnvRef = useRef(null);              // remote envelope awaiting unlock
   const [aiInput, setAiInput] = useState("");
   const [aiOut, setAiOut] = useState("");
   const [aiBusy, setAiBusy] = useState(false);
@@ -181,20 +191,34 @@ export default function Trinacria() {
   useEffect(() => {
     let alive = true;
     (async () => {
-      const [t, l, a, k, g] = await Promise.all([sGet(K_T), sGet(K_L), sGet(K_AI), sGet(K_KEY), sGet(K_GH)]);
+      const [g, sec] = await Promise.all([sGet(K_GH), sGet(K_SEC)]);
+      if (!alive) return;
+      if (g?.token && g?.gistId) { setGh(g); setGhToken(g.token); }
+      // Encrypted vault present -> show the lock screen; data loads on unlock.
+      if (sec?.salt && sec?.check) { setSecured(true); setLocked(true); setLoaded(true); return; }
+      const [t, l, a, k] = await Promise.all([sGet(K_T), sGet(K_L), sGet(K_AI), sGet(K_KEY)]);
       if (!alive) return;
       if (t?.weekday && t?.weekend) setTemplates(t);
       if (l) setLogs(l);
       if (a) setAiCfg((p) => ({ ...p, ...a }));
       if (a?.remember && k?.key) setApiKey(k.key);
-      if (g?.token && g?.gistId) { setGh(g); setGhToken(g.token); }
       setLoaded(true);
     })();
     return () => { alive = false; };
   }, []);
-  useEffect(() => { if (loaded) sSet(K_T, templates); }, [templates, loaded]);
-  useEffect(() => { if (loaded) sSet(K_L, logs); }, [logs, loaded]);
-  useEffect(() => { if (loaded) sSet(K_AI, aiCfg); }, [aiCfg, loaded]);
+  // plaintext persistence — only when NOT encrypted
+  useEffect(() => { if (loaded && !secured) sSet(K_T, templates); }, [templates, loaded, secured]);
+  useEffect(() => { if (loaded && !secured) sSet(K_L, logs); }, [logs, loaded, secured]);
+  useEffect(() => { if (loaded && !secured) sSet(K_AI, aiCfg); }, [aiCfg, loaded, secured]);
+  // encrypted-vault persistence — only when unlocked
+  useEffect(() => {
+    if (!loaded || !secured || locked || !cryptoRef.current.key) return;
+    const id = setTimeout(async () => {
+      const { key, salt } = cryptoRef.current;
+      try { await sSet(K_VAULT, await encryptJSON(key, salt, snapshotOf(stateRef.current))); } catch { /* skip */ }
+    }, 600);
+    return () => clearTimeout(id);
+  }, [templates, logs, aiCfg, loaded, secured, locked]);
   useEffect(() => { const id = setInterval(() => setNow(new Date()), 60000); return () => clearInterval(id); }, []);
   useEffect(() => { if (loaded && aiCfg.remember && apiKey.trim()) sSet(K_KEY, { key: apiKey.trim() }); }, [apiKey, aiCfg.remember, loaded]);
   useEffect(() => { if (loaded) sSet(K_GH, gh); }, [gh, loaded]);
@@ -221,12 +245,37 @@ export default function Trinacria() {
 
   // time-of-day theming: phase from the device clock, with a manual override
   const themeMode = aiCfg.theme || "auto"; // auto | light | notte
+  // In-app zoom — the desktop-wrapped PWA gives no browser zoom of its own, so we
+  // scale the whole interface ourselves. Persists & syncs with the rest of config.
+  const zoom = aiCfg.zoom || 1;
+  const ZMIN = 0.8, ZMAX = 1.6, ZSTEP = 0.1;
+  const adjustZoom = (dir) => setAiCfg((p) => {
+    const next = Math.min(ZMAX, Math.max(ZMIN, Math.round(((p.zoom || 1) + dir * ZSTEP) * 100) / 100));
+    return { ...p, zoom: next };
+  });
+  useEffect(() => { document.documentElement.style.zoom = String(zoom); }, [zoom]);
+  // Ctrl/⌘ +/-/0 — the desktop wrapper swallows the browser's own zoom keys, so
+  // we honour them ourselves.
+  useEffect(() => {
+    const onKey = (e) => {
+      if (!(e.ctrlKey || e.metaKey)) return;
+      if (e.key === "=" || e.key === "+") { e.preventDefault(); adjustZoom(1); }
+      else if (e.key === "-") { e.preventDefault(); adjustZoom(-1); }
+      else if (e.key === "0") { e.preventDefault(); setAiCfg((p) => ({ ...p, zoom: 1 })); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
   const hr = now.getHours();
   const phase = hr < 5 ? "notte" : hr < 11 ? "alba" : hr < 17 ? "giorno" : hr < 21 ? "sera" : "notte";
   const appearance = themeMode === "notte" ? "dark" : themeMode === "light" ? "light" : (phase === "notte" ? "dark" : "light");
   const tintPhase = (appearance === "light" && phase === "notte") ? "sera" : phase;
   useEffect(() => {
-    document.body.style.background = appearance === "dark" ? "#0F0B06" : "#FAF3E4";
+    const pageBg = appearance === "dark" ? "#0F0B06" : "#FAF3E4";
+    // Set on <html> too: .tr-root's vertical margin collapses up to the html
+    // element, so an unstyled html would reveal a cream strip top & bottom in dark mode.
+    document.documentElement.style.background = pageBg;
+    document.body.style.background = pageBg;
     document.querySelector('meta[name="theme-color"]')?.setAttribute("content", appearance === "dark" ? "#16110A" : "#FAF3E4");
   }, [appearance]);
   useEffect(() => {
@@ -281,20 +330,59 @@ export default function Trinacria() {
 
   /* ---- multi-device sync (proxy or direct gist) ---- */
   const connOf = (token) => ({ token, proxy: PROXY, secret: PROXY_SECRET });
-  const canSync = (token, gistId) => !!gistId && (useProxy || !!token);
+  // Proxy mode: the Worker owns the gist, so sync is always on. Direct mode
+  // (no proxy) still needs a token + a gist id the user supplied.
+  const canSync = () => useProxy || (!!gh.token && !!gh.gistId);
+  // Stable signature of the *shared* payload (excludes the volatile exportedAt
+  // timestamp). Used to skip no-op syncs and break the self-trigger loop that
+  // otherwise hammered GitHub into a 403 rate-limit.
+  const sigOf = (snap) => JSON.stringify({ templates: snap?.templates, logs: snap?.logs });
+  const lastSyncedSig = useRef(null);   // signature last pulled/pushed
+  const syncingRef = useRef(false);     // guard against overlapping syncs
+  const LOCKED = "__locked__";
+  // Turn whatever the gist holds into a plain snapshot. Encrypted gists are
+  // decrypted with the in-memory key; if we don't have it, stash the envelope
+  // and signal the caller to raise the lock screen.
+  const decodeRemote = async (raw) => {
+    if (!raw || !isEnvelope(raw)) return raw;
+    const cr = cryptoRef.current;
+    if (cr.password) {
+      const key = raw.salt === cr.salt ? cr.key : await deriveKey(cr.password, raw.salt);
+      try { return await decryptJSON(key, raw); } catch { /* fall through */ }
+    }
+    pendingEnvRef.current = raw;
+    setLocked(true);
+    throw new Error(LOCKED);
+  };
   const syncNow = async () => {
     const { token, gistId } = gh;
-    if (!canSync(token, gistId)) return;
+    if (!canSync()) return;
+    if (syncingRef.current || locked) return;
+    syncingRef.current = true;
     setSyncState("syncing"); setSyncErr("");
     try {
-      const remote = await pullGist(connOf(token), gistId);
+      const remote = await decodeRemote(await pullGist(connOf(token), gistId));
       const merged = mergeState(snapshotOf(stateRef.current), remote);
+      const mergedSig = sigOf(merged);
+      // Remember this signature *before* applying state, so the re-render the
+      // setState triggers sees "nothing changed" and does not bounce back into
+      // another push (this was the runaway loop).
+      lastSyncedSig.current = mergedSig;
       setTemplates(merged.templates);
       setLogs(merged.logs);
-      await pushGist(connOf(token), gistId, merged);
+      // Only write when the merge actually differs from what's in the gist.
+      if (sigOf(remote) !== mergedSig) {
+        const cr = cryptoRef.current;
+        const payload = secured && cr.key ? await encryptJSON(cr.key, cr.salt, merged) : merged;
+        await pushGist(connOf(token), gistId, payload);
+      }
       setGh((p) => ({ ...p, lastSync: Date.now() }));
       setSyncState("synced");
-    } catch (e) { setSyncErr(String(e.message || e)); setSyncState("error"); }
+    } catch (e) {
+      if (String(e.message) === LOCKED) { setSyncState("idle"); }
+      else { setSyncErr(String(e.message || e)); setSyncState("error"); }
+    }
+    finally { syncingRef.current = false; }
   };
   // keep a stable handle so the debounce effect needn't depend on syncNow
   const syncRef = useRef(syncNow);
@@ -306,7 +394,12 @@ export default function Trinacria() {
     setSyncState("syncing"); setSyncErr("");
     try {
       let gistId = gh.gistId;
-      if (!gistId) gistId = await createGist(connOf(token), snapshotOf(stateRef.current));
+      if (!gistId) {
+        const cr = cryptoRef.current;
+        const seed = snapshotOf(stateRef.current);
+        const payload = secured && cr.key ? await encryptJSON(cr.key, cr.salt, seed) : seed;
+        gistId = await createGist(connOf(token), payload);
+      }
       setGh({ token: useProxy ? "" : token, gistId, lastSync: Date.now() });
       setSyncState("synced");
     } catch (e) { setSyncErr(String(e.message || e)); setSyncState("error"); }
@@ -316,20 +409,95 @@ export default function Trinacria() {
     setGhToken(""); setSyncState("idle"); setSyncErr("");
   };
 
-  // pull + merge once we're connected (covers boot and the moment of connecting)
+  /* ---- at-rest encryption handlers ---- */
+  const applySnap = (snap) => {
+    if (snap?.templates?.weekday && snap?.templates?.weekend) setTemplates(snap.templates);
+    if (snap?.logs) setLogs(snap.logs);
+    if (snap?.aiCfg) setAiCfg((p) => ({ ...p, ...snap.aiCfg }));
+  };
+  // Unlock at boot (local vault) or adopt encryption from a synced gist.
+  const tryUnlock = async (password) => {
+    if (!password) return "Enter your password.";
+    if (!cryptoReady()) return "Encryption isn’t available in this browser.";
+    const sec = await sGet(K_SEC);
+    if (sec?.salt && sec?.check) {
+      let key;
+      try {
+        key = await deriveKey(password, sec.salt);
+        await decryptJSON(key, sec.check);            // throws on wrong password
+      } catch { return "Wrong password."; }
+      cryptoRef.current = { key, salt: sec.salt, password };
+      const vault = await sGet(K_VAULT);
+      if (isEnvelope(vault)) { try { applySnap(await decryptJSON(key, vault)); } catch { /* corrupt */ } }
+      setSecured(true); setLocked(false); pendingEnvRef.current = null;
+      if (canSync()) syncRef.current();
+      return null;
+    }
+    // No local vault, but a synced gist arrived encrypted -> adopt it here.
+    const pend = pendingEnvRef.current;
+    if (isEnvelope(pend)) {
+      let snap;
+      try { snap = await decryptJSON(await deriveKey(password, pend.salt), pend); }
+      catch { return "Wrong password."; }
+      const salt = randomSalt();
+      const key = await deriveKey(password, salt);
+      await sSet(K_SEC, { salt, check: await encryptJSON(key, salt, VERIFIER) });
+      await sSet(K_VAULT, await encryptJSON(key, salt, snap));
+      await Promise.all([sDel(K_T), sDel(K_L), sDel(K_AI)]);
+      cryptoRef.current = { key, salt, password };
+      applySnap(snap);
+      setSecured(true); setLocked(false); pendingEnvRef.current = null;
+      return null;
+    }
+    return "Nothing to unlock on this device.";
+  };
+  // Turn encryption on from settings.
+  const enableLock = async (password) => {
+    if (!cryptoReady()) return "Encryption isn’t available in this browser.";
+    if ((password || "").length < 4) return "Use at least 4 characters.";
+    const salt = randomSalt();
+    const key = await deriveKey(password, salt);
+    await sSet(K_SEC, { salt, check: await encryptJSON(key, salt, VERIFIER) });
+    await sSet(K_VAULT, await encryptJSON(key, salt, snapshotOf(stateRef.current)));
+    await Promise.all([sDel(K_T), sDel(K_L), sDel(K_AI)]);
+    cryptoRef.current = { key, salt, password };
+    setSecured(true); setLocked(false);
+    if (canSync()) syncRef.current();   // re-push encrypted
+    return null;
+  };
+  // Turn encryption off — write plaintext back and re-push it.
+  const disableLock = async () => {
+    const snap = snapshotOf(stateRef.current);
+    await Promise.all([sSet(K_T, snap.templates), sSet(K_L, snap.logs), sSet(K_AI, aiCfg)]);
+    await Promise.all([sDel(K_SEC), sDel(K_VAULT)]);
+    cryptoRef.current = { key: null, salt: null, password: null };
+    setSecured(false); setLocked(false);
+    if (canSync()) setTimeout(() => syncRef.current(), 0);
+  };
+  // Quick re-lock (shared device) without removing encryption.
+  const lockNow = () => {
+    cryptoRef.current = { key: null, salt: null, password: null };
+    setLocked(true); setSettingsOpen(false);
+  };
+
+  const syncReady = useProxy || (!!gh.token && !!gh.gistId);
+  // pull + merge once we're ready (covers boot and the moment of connecting)
   useEffect(() => {
-    if (loaded && canSync(gh.token, gh.gistId)) syncRef.current();
-  }, [loaded, gh.token, gh.gistId]);
-  // debounced push whenever data changes while connected
+    if (loaded && syncReady) syncRef.current();
+  }, [loaded, syncReady]);
+  // debounced push whenever data *actually* changes while ready.
+  // The signature check is what stops a sync-induced re-render from
+  // rescheduling another sync forever.
   useEffect(() => {
-    if (!loaded || !canSync(gh.token, gh.gistId)) return;
-    const id = setTimeout(() => syncRef.current(), 4000);
+    if (!loaded || !syncReady) return;
+    if (sigOf(snapshotOf(stateRef.current)) === lastSyncedSig.current) return;
+    const id = setTimeout(() => syncRef.current(), 6000);
     return () => clearTimeout(id);
-  }, [templates, logs, loaded, gh.token, gh.gistId]);
+  }, [templates, logs, loaded, syncReady]);
   const syncLabel = syncState === "syncing" ? "syncing…"
     : syncState === "error" ? "sync error"
-    : gh.gistId ? (gh.lastSync ? `synced ${new Date(gh.lastSync).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` : "connected")
-    : "not connected";
+    : gh.lastSync ? `synced ${new Date(gh.lastSync).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+    : syncReady ? "connected" : "not connected";
 
   /* ---- reminders: nudge when a block becomes "now" (app open) ---- */
   const notify = !!aiCfg.notify;
@@ -360,7 +528,7 @@ export default function Trinacria() {
     }).join("\n");
     return `Day: ${onToday ? "today" : dayLabel(viewDate)} (${weekendView ? "weekend" : "weekday"}).\nPlan:\n${lines}\nReflection so far: ${log.reflection || "(none)"}`;
   };
-  const SYSTEM = "You are Il Consigliere, Rahul's trusted advisor inside his daily planner. His model: a sliding window of three streams in fixed order — IITM (study, morning), Maersk (work, day), DeckView (his SaaS, night) — with intensity that flexes. DSA is one problem a day inside Maersk dead-time. Be direct, warm, brief. No flattery, no hedging. Use short clear sections with bold subheadings only when it genuinely helps. Push back when his plan is unrealistic. Keep it under ~180 words unless asked for more.";
+  const SYSTEM = "You are Il Consigliere, Rahul's trusted advisor inside his daily planner. His model: a sliding window of three streams in fixed order — IITM (study, morning), Maersk (work, day), DeckView (his SaaS, night) — with intensity that flexes. DSA is one problem a day inside Maersk dead-time. Be warm, calm, and encouraging — a steady ally, not a taskmaster. The order is a rhythm to return to, not a cage: some days a stream gets nothing, and that's fine — progress is cumulative, not daily. Help him choose what matters today and let the rest wait without guilt. Be honest and clear, gently surface when a plan is overloaded, and offer the lighter version. No flattery, no shame, no hustle-talk. Use short clear sections with bold subheadings only when it genuinely helps. Keep it under ~180 words unless asked for more.";
 
   const runAI = async (userMsg) => {
     if (!useProxy && !apiKey.trim()) { setSettingsOpen(true); setAiErr("Add a key to wake your consigliere."); return; }
@@ -387,7 +555,7 @@ export default function Trinacria() {
     try {
       const out = await askAI({
         provider: aiCfg.provider, apiKey: apiKey.trim(), model: aiCfg.model,
-        system: "You are Il Consigliere. Write ONE short opening line for Rahul's day — a single sentence under 14 words, a focused intention in your warm, direct voice. No quotes, no preamble, no emoji.",
+        system: "You are Il Consigliere. Write ONE short opening line for Rahul's day — a single sentence under 14 words, a calm, encouraging intention in your warm voice. Invite, don't command. No quotes, no preamble, no emoji.",
         user: buildContext(),
       });
       const line = out.split("\n")[0].replace(/^["“'']+|["”'']+$/g, "").trim();
@@ -406,13 +574,21 @@ export default function Trinacria() {
 
       {/* ---------------- HEADER ---------------- */}
       <header className="tr-head">
-        <Emblem activeStream={weekendView ? null : activeStream} progress={streamPct} />
+        <Emblem activeStream={weekendView ? null : activeStream} progress={streamPct} onOpen={() => setEmblemOpen(true)} />
         <div className="tr-headtext">
           <p className="tr-eyebrow">La giornata in tre movimenti</p>
           <h1 className="tr-title">Trinacria</h1>
           <p className="tr-sub">Your day in three movements — study, work, the thing you’re building. The order holds; the intensity bends.</p>
         </div>
         <div className="tr-headbtns">
+          <div className="tr-zoom" role="group" aria-label="Zoom">
+            <button className="tr-zbtn" onClick={() => adjustZoom(-1)} disabled={zoom <= ZMIN}
+              aria-label="Zoom out" title="Zoom out">−</button>
+            <button className="tr-zlbl" onClick={() => setAiCfg((p) => ({ ...p, zoom: 1 }))}
+              aria-label="Reset zoom" title="Reset zoom">{Math.round(zoom * 100)}%</button>
+            <button className="tr-zbtn" onClick={() => adjustZoom(1)} disabled={zoom >= ZMAX}
+              aria-label="Zoom in" title="Zoom in">+</button>
+          </div>
           <button className="tr-theme" onClick={() => setAiCfg((p) => ({ ...p, theme: THEME_CYCLE[themeMode] }))}
             aria-label="Cycle appearance" title={`Appearance: ${THEME_NAME[themeMode]}`}>{THEME_ICON[themeMode]}</button>
           <button className="tr-gear" onClick={() => setSettingsOpen((v) => !v)} aria-label="AI settings" title="Consigliere settings">✦</button>
@@ -440,6 +616,14 @@ export default function Trinacria() {
             );
           })}
         </div>
+      )}
+
+      {/* ---------------- LOCK SCREEN ---------------- */}
+      {locked && <LockScreen remote={!secured} onUnlock={tryUnlock} />}
+
+      {/* ---------------- EMBLEM SHOWCASE ---------------- */}
+      {emblemOpen && (
+        <EmblemShowcase activeStream={weekendView ? null : activeStream} progress={streamPct} onClose={() => setEmblemOpen(false)} />
       )}
 
       {/* ---------------- SETTINGS DRAWER ---------------- */}
@@ -472,25 +656,25 @@ export default function Trinacria() {
 
               <section className="tr-section">
                 <h3 className="tr-sectitle">Il Consigliere · AI</h3>
-                <div className="tr-setrow">
-                  <span className="tr-setlabel">Provider</span>
-                  <div className="tr-provsel">
-                    {Object.keys(PROVIDERS).map((k) => (
-                      <button key={k} className={`tr-prov ${aiCfg.provider === k ? "on" : ""}`}
-                        onClick={() => setAiCfg((p) => ({ ...p, provider: k, model: PROVIDERS[k].models[0] }))}>{PROVIDERS[k].name}</button>
-                    ))}
-                  </div>
-                </div>
-                <div className="tr-setrow">
-                  <span className="tr-setlabel">Model</span>
-                  <select className="tr-modelsel" value={aiCfg.model} onChange={(e) => setAiCfg((p) => ({ ...p, model: e.target.value }))}>
-                    {PROVIDERS[aiCfg.provider].models.map((m) => <option key={m} value={m}>{m}</option>)}
-                  </select>
-                </div>
                 {useProxy ? (
-                  <p className="tr-setnote">🔒 Keys are held by your secure proxy — nothing to enter here.</p>
+                  <p className="tr-setnote">🔒 Your consigliere runs on <b>Groq</b> through your secure proxy — the key and model are handled server-side, nothing to set here.</p>
                 ) : (
                   <>
+                    <div className="tr-setrow">
+                      <span className="tr-setlabel">Provider</span>
+                      <div className="tr-provsel">
+                        {Object.keys(PROVIDERS).map((k) => (
+                          <button key={k} className={`tr-prov ${aiCfg.provider === k ? "on" : ""}`}
+                            onClick={() => setAiCfg((p) => ({ ...p, provider: k, model: PROVIDERS[k].models[0] }))}>{PROVIDERS[k].name}</button>
+                        ))}
+                      </div>
+                    </div>
+                    <div className="tr-setrow">
+                      <span className="tr-setlabel">Model</span>
+                      <select className="tr-modelsel" value={aiCfg.model} onChange={(e) => setAiCfg((p) => ({ ...p, model: e.target.value }))}>
+                        {PROVIDERS[aiCfg.provider].models.map((m) => <option key={m} value={m}>{m}</option>)}
+                      </select>
+                    </div>
                     <div className="tr-setrow">
                       <span className="tr-setlabel">API key</span>
                       <input className="tr-keyinput" type="password" value={apiKey} placeholder={PROVIDERS[aiCfg.provider].keyHint}
@@ -508,7 +692,10 @@ export default function Trinacria() {
               <section className="tr-section">
                 <h3 className="tr-sectitle">Sync · across devices</h3>
                 {useProxy ? (
-                  <p className="tr-setnote">🔒 Synced through your secure proxy — no token needed. Just turn it on.</p>
+                  <>
+                    <p className="tr-setnote">🔒 Synced automatically across your devices through your secure proxy — nothing to set up.</p>
+                    <span className={`tr-syncstat is-${syncState}`}><i className="tr-syncdot" />{syncLabel}</span>
+                  </>
                 ) : (
                   <>
                     <p className="tr-setnote">Keep your day in step on phone and laptop through a <b>private GitHub gist</b>. Use a token with <b>only the gist scope</b>.</p>
@@ -517,22 +704,24 @@ export default function Trinacria() {
                       <input className="tr-keyinput" type="password" value={ghToken} placeholder="github_pat_… / ghp_…"
                         onChange={(e) => setGhToken(e.target.value)} />
                     </div>
+                    {gh.gistId ? (
+                      <div className="tr-syncrow">
+                        <span className={`tr-syncstat is-${syncState}`}><i className="tr-syncdot" />{syncLabel}</span>
+                        <button className="tr-databtn" onClick={syncNow} disabled={syncState === "syncing"}>Sync now</button>
+                        <button className="tr-databtn" onClick={disconnectGist}>Disconnect</button>
+                      </div>
+                    ) : (
+                      <button className="tr-connect" onClick={connectGist} disabled={syncState === "syncing"}>
+                        {syncState === "syncing" ? "Connecting…" : "Connect & sync"}
+                      </button>
+                    )}
+                    {gh.gistId && <p className="tr-setnote">Linked gist <b>{gh.gistId.slice(0, 8)}…</b> · token stays only in this browser.</p>}
                   </>
                 )}
-                {gh.gistId ? (
-                  <div className="tr-syncrow">
-                    <span className={`tr-syncstat is-${syncState}`}><i className="tr-syncdot" />{syncLabel}</span>
-                    <button className="tr-databtn" onClick={syncNow} disabled={syncState === "syncing"}>Sync now</button>
-                    <button className="tr-databtn" onClick={disconnectGist}>Disconnect</button>
-                  </div>
-                ) : (
-                  <button className="tr-connect" onClick={connectGist} disabled={syncState === "syncing"}>
-                    {syncState === "syncing" ? "Connecting…" : useProxy ? "Turn on sync" : "Connect & sync"}
-                  </button>
-                )}
                 {syncErr && <p className="tr-datamsg tr-syncerr">{syncErr}</p>}
-                {gh.gistId && <p className="tr-setnote">Linked gist <b>{gh.gistId.slice(0, 8)}…</b>{useProxy ? " · via your proxy." : " · token stays only in this browser."}</p>}
               </section>
+
+              <PrivacySection secured={secured} onEnable={enableLock} onDisable={disableLock} onLockNow={lockNow} />
 
               <section className="tr-section">
                 <h3 className="tr-sectitle">Your data</h3>
@@ -612,15 +801,29 @@ export default function Trinacria() {
                       </div>
                       <p className="tr-label">{b.label}</p>
                       {b.note && <p className="tr-note">{b.note}</p>}
-                      <button className="tr-notebtn" onClick={() => setOpenNote(noteOpen ? null : b.id)}>
-                        {today ? "edit what you did" : "add what you did"}
-                      </button>
-                      {noteOpen && (
-                        <textarea className="tr-noteinput" autoFocus rows={2} value={today}
-                          placeholder={b.cat === "dsa" ? "today’s problem + pattern — e.g. ‘Two Sum — hashmap’" : "what actually happened here?"}
-                          onChange={(e) => setNote(b.id, e.target.value)} />
+                      {!today && !noteOpen && (
+                        <button className="tr-notebtn" onClick={() => setOpenNote(b.id)}>
+                          add what you did
+                        </button>
                       )}
-                      {!noteOpen && today && <p className="tr-donenote">{today}</p>}
+                      {today && !noteOpen && (
+                        <button className="tr-donechip" onClick={() => setOpenNote(b.id)}
+                          title="Click to view or edit">
+                          <span className="tr-donecheck">✓</span>
+                          <span className="tr-doneprev">{today}</span>
+                          <span className="tr-doneedit">edit</span>
+                        </button>
+                      )}
+                      {noteOpen && (
+                        <>
+                          <textarea className="tr-noteinput" autoFocus rows={2} value={today}
+                            placeholder={b.cat === "dsa" ? "today’s problem + pattern — e.g. ‘Two Sum — hashmap’" : "what actually happened here?"}
+                            onChange={(e) => setNote(b.id, e.target.value)} />
+                          <button className="tr-notedone" onClick={() => setOpenNote(null)}>
+                            {today ? "done" : "close"}
+                          </button>
+                        </>
+                      )}
                     </div>
                   </div>
                 </li>
@@ -685,9 +888,9 @@ export default function Trinacria() {
             </div>
 
             <div className="tr-chips">
-              <button className="tr-chip" onClick={() => runAI("Sequence my day and name the one thing to protect today.")}>Plan today</button>
-              <button className="tr-chip" onClick={() => runAI("Based on today, what exactly should I pre-load tonight for tomorrow’s first IITM and DeckView blocks?")}>Pre-load tonight</button>
-              <button className="tr-chip" onClick={() => runAI("Here’s what I did today. Give me one honest, useful reflection — no flattery.")}>Reflect</button>
+              <button className="tr-chip" onClick={() => runAI("Help me ease into today. What's the one thing worth protecting, and what can wait without guilt?")}>Plan today</button>
+              <button className="tr-chip" onClick={() => runAI("Looking at today, what would be a gentle thing to pre-load tonight for tomorrow's first IITM and DeckView blocks? Keep it light.")}>Pre-load tonight</button>
+              <button className="tr-chip" onClick={() => runAI("Here's how today went. Give me one kind, honest reflection — name what went well, and one small nudge, no shame.")}>Reflect</button>
             </div>
 
             <div className="tr-askrow">
@@ -742,50 +945,254 @@ export default function Trinacria() {
 }
 
 /* ---------------- Gilded triskele emblem ---------------- */
-function Emblem({ activeStream, progress = {} }) {
-  const arms = [
-    { ang: 90, stream: "IITM", c: CATS.iitm.color },
-    { ang: 330, stream: "Maersk", c: CATS.maersk.color },
-    { ang: 210, stream: "DeckView", c: CATS.deckview.color },
-  ];
-  const cx = 50, cy = 50, r = 30, curl = 24;
-  const path = (deg) => {
-    const a = (deg * Math.PI) / 180;
-    const ex = cx + r * Math.cos(a), ey = cy - r * Math.sin(a);
-    const mx = cx + r * 0.5 * Math.cos(a), my = cy - r * 0.5 * Math.sin(a);
-    const pa = a + Math.PI / 2;
-    const ccx = mx + curl * Math.cos(pa), ccy = my - curl * Math.sin(pa);
-    return { d: `M${cx} ${cy} Q ${ccx.toFixed(1)} ${ccy.toFixed(1)} ${ex.toFixed(1)} ${ey.toFixed(1)}`, ex, ey };
-  };
+const EMBLEM_ARMS = [
+  { ang: 90, stream: "IITM", c: CATS.iitm.color, name: CATS.iitm.name },
+  { ang: 330, stream: "Maersk", c: CATS.maersk.color, name: CATS.maersk.name },
+  { ang: 210, stream: "DeckView", c: CATS.deckview.color, name: CATS.deckview.name },
+];
+
+/* The Trinacria proper — a Gorgon (Medusa) head with snake hair at the hub and
+   three bent running legs, each lit by its stream's progress. Reused at any size
+   by the header button and the showcase. */
+function TriskeleArt({ activeStream, progress = {}, size = 64 }) {
+  const C = 50;
+  // one bent leg pointing up, knee bending clockwise; rotated 120° for the trio
+  const LEG = "M50 50 L50 30 Q50 23 57 21.8 L71 18.5";
+  // a writhing nest of serpents. Each one veers tangentially (it does not shoot
+  // straight out) and ends in a little curled head, so the halo reads as Medusa's
+  // snaking hair rather than an even sunburst. All deterministic from the index.
+  const N = 8;
+  const snakes = Array.from({ length: N }, (_, i) => {
+    const f = (m, lo, hi) => lo + ((i * m) % (hi - lo + 1));  // cheap deterministic spread
+    const baseDeg = -90 + i * (360 / N) + (f(37, 0, 22) - 11); // uneven base angles
+    const a = (baseDeg * Math.PI) / 180;
+    const dir = i % 2 ? 1 : -1;                                // alternate the curl side
+    const r0 = 10.4;
+    const len = 7 + f(5, 0, 9) + (i % 3) * 1.6;               // 7–17: long tendrils and short coils
+    const sweep = dir * (0.34 + f(13, 0, 5) * 0.04);          // tangential veer of the whole strand
+    const aEnd = a + sweep;
+    const r1 = r0 + len;
+    const x0 = C + r0 * Math.cos(a), y0 = C + r0 * Math.sin(a);
+    const ex = C + r1 * Math.cos(aEnd), ey = C + r1 * Math.sin(aEnd);
+    // two control points pull the body to one side then the other (an S)
+    const mid = (t, off, ang) => [
+      C + (r0 + len * t) * Math.cos(a + sweep * t) + off * Math.cos(a + sweep * t + Math.PI / 2),
+      C + (r0 + len * t) * Math.sin(a + sweep * t) + off * Math.sin(a + sweep * t + Math.PI / 2),
+    ];
+    const c1 = mid(0.34, dir * (3.4 + f(3, 0, 3))), c2 = mid(0.68, -dir * (2.2 + f(2, 0, 2)));
+    // a curled hook at the very tip so the strand finishes like a snake's head
+    const hook = dir * (2.4 + f(2, 0, 2));
+    const hx = ex + hook * Math.cos(aEnd + Math.PI / 2), hy = ey + hook * Math.sin(aEnd + Math.PI / 2);
+    return {
+      d: `M${x0.toFixed(1)} ${y0.toFixed(1)} C ${c1[0].toFixed(1)} ${c1[1].toFixed(1)} ${c2[0].toFixed(1)} ${c2[1].toFixed(1)} ${ex.toFixed(1)} ${ey.toFixed(1)} Q ${(ex + (ex - c2[0]) * 0.3).toFixed(1)} ${(ey + (ey - c2[1]) * 0.3).toFixed(1)} ${hx.toFixed(1)} ${hy.toFixed(1)}`,
+      hx, hy, w: 2.5 - (i % 3) * 0.4,                          // tapering coil weights
+    };
+  });
   return (
-    <svg className="tr-emblem" viewBox="0 0 100 100" width="64" height="64" aria-hidden="true">
+    <svg className="tr-emblem" viewBox="0 0 100 100" width={size} height={size} aria-hidden="true">
       <defs>
         <radialGradient id="gold" cx="40%" cy="35%" r="75%">
           <stop offset="0%" stopColor="#F0D67A" /><stop offset="55%" stopColor="#C9A227" /><stop offset="100%" stopColor="#8C6D1F" />
         </radialGradient>
+        <radialGradient id="face" cx="42%" cy="36%" r="72%">
+          <stop offset="0%" stopColor="#FCEBB0" /><stop offset="58%" stopColor="#E6C766" /><stop offset="100%" stopColor="#B8912F" />
+        </radialGradient>
       </defs>
       <circle cx="50" cy="50" r="46" fill="none" stroke="url(#gold)" strokeWidth="1.4" opacity="0.55" />
       <circle cx="50" cy="50" r="40" fill="none" stroke="url(#gold)" strokeWidth="0.7" opacity="0.4" />
-      {arms.map((arm) => {
-        const p = path(arm.ang);
+
+      {/* three bent legs (drawn first; the head overlaps their hubs) */}
+      {EMBLEM_ARMS.map((arm, i) => {
         const live = activeStream === arm.stream;
         const prog = Math.max(0, Math.min(1, progress[arm.stream] || 0));
         return (
-          <g key={arm.stream} className={live ? "tr-armlive" : ""} style={live ? { color: arm.c } : undefined}>
-            {/* faint gold base — the unlit arm */}
-            <path d={p.d} fill="none" stroke="url(#gold)" strokeWidth="3.4" strokeLinecap="round" opacity="0.45" />
-            {/* coloured overlay reveals as that stream's blocks get done */}
-            <path d={p.d} fill="none" stroke={arm.c} strokeWidth="3.4" strokeLinecap="round"
+          <g key={arm.stream} transform={`rotate(${i * 120} 50 50)`} className={live ? "tr-armlive" : ""} style={live ? { color: arm.c } : undefined}>
+            <path d={LEG} fill="none" stroke="url(#gold)" strokeWidth="6.6" strokeLinecap="round" strokeLinejoin="round" opacity="0.5" />
+            <path d={LEG} fill="none" stroke={arm.c} strokeWidth="6.6" strokeLinecap="round" strokeLinejoin="round"
               pathLength="1" style={{ strokeDasharray: 1, strokeDashoffset: 1 - prog, transition: "stroke-dashoffset .6s ease" }} />
-            <circle cx={p.ex} cy={p.ey} r={live ? 7.5 : 6} fill={arm.c} fillOpacity={0.3 + 0.7 * prog}
-              stroke="url(#gold)" strokeWidth="1.6" />
-            {live && <circle cx={p.ex} cy={p.ey} r="6" fill="none" stroke={arm.c} strokeWidth="1.4" className="tr-armring" />}
+            {/* foot */}
+            <ellipse cx="71" cy="18.5" rx="6.2" ry="3.3" transform="rotate(-14 71 18.5)"
+              fill={arm.c} fillOpacity={0.35 + 0.65 * prog} stroke="url(#gold)" strokeWidth="1.4" />
+            {live && <circle cx="71" cy="18.5" r="7" fill="none" stroke={arm.c} strokeWidth="1.4" className="tr-armring" />}
           </g>
         );
       })}
-      <circle cx="50" cy="50" r="6.5" fill="url(#gold)" stroke="#8C6D1F" strokeWidth="0.8" />
-      <circle cx="48" cy="48" r="2" fill="#FBEFC2" opacity="0.8" />
+
+      {/* Gorgon head */}
+      <g>
+        {/* serpents: a darker under-stroke gives each coil body and depth */}
+        {snakes.map((s, i) => (
+          <g key={i}>
+            <path d={s.d} fill="none" stroke="#5C460F" strokeWidth={s.w + 1.5} strokeLinecap="round" opacity="0.45" />
+            <path d={s.d} fill="none" stroke="url(#gold)" strokeWidth={s.w} strokeLinecap="round" opacity="0.95" />
+            <circle cx={s.hx} cy={s.hy} r="1.5" fill="url(#face)" stroke="#5C460F" strokeWidth="0.4" />
+          </g>
+        ))}
+        <circle cx="50" cy="50" r="12" fill="url(#face)" stroke="url(#gold)" strokeWidth="1.4" />
+        {/* lower-face shadow crescent for depth */}
+        <path d="M39 51 A 12 12 0 0 0 61 51 A 14 16 0 0 1 39 51 Z" fill="#7A5E22" opacity="0.22" />
+        {/* furrowed brows angled down toward the nose — a fierce, solemn glare */}
+        <path d="M42.6 45 L48.4 47" stroke="#5C460F" strokeWidth="1.3" fill="none" strokeLinecap="round" />
+        <path d="M57.4 45 L51.6 47" stroke="#5C460F" strokeWidth="1.3" fill="none" strokeLinecap="round" />
+        {/* narrowed almond eyes with pupils */}
+        <path d="M43.4 49.3 Q45.7 47.7 48 49.3 Q45.7 50.5 43.4 49.3 Z" fill="#FBEFC6" stroke="#5C460F" strokeWidth="0.5" />
+        <path d="M52 49.3 Q54.3 47.7 56.6 49.3 Q54.3 50.5 52 49.3 Z" fill="#FBEFC6" stroke="#5C460F" strokeWidth="0.5" />
+        <circle cx="45.7" cy="49.1" r="1.05" fill="#2A1D0A" />
+        <circle cx="54.3" cy="49.1" r="1.05" fill="#2A1D0A" />
+        {/* nose + a set, unsmiling mouth */}
+        <path d="M50 50 L48.7 53.6 Q50 54.6 51.3 53.6" stroke="#7A5E22" strokeWidth="1" fill="none" strokeLinecap="round" strokeLinejoin="round" />
+        <path d="M46.4 56.4 Q50 57.4 53.6 56.4" stroke="#5C460F" strokeWidth="1.2" fill="none" strokeLinecap="round" />
+      </g>
     </svg>
+  );
+}
+
+/* Settings → Privacy: enable / remove / quick-lock the password. */
+function PrivacySection({ secured, onEnable, onDisable, onLockNow }) {
+  const [open, setOpen] = useState(false);
+  const [pw, setPw] = useState("");
+  const [pw2, setPw2] = useState("");
+  const [msg, setMsg] = useState("");
+  const [busy, setBusy] = useState(false);
+  const reset = () => { setOpen(false); setPw(""); setPw2(""); setMsg(""); };
+  const enable = async () => {
+    if (pw !== pw2) { setMsg("Passwords don’t match."); return; }
+    setBusy(true); setMsg("");
+    const err = await onEnable(pw);
+    setBusy(false);
+    if (err) setMsg(err); else reset();
+  };
+  const disable = async () => {
+    if (!window.confirm("Remove the password and store your data unencrypted?")) return;
+    setBusy(true); await onDisable(); setBusy(false);
+  };
+  return (
+    <section className="tr-section">
+      <h3 className="tr-sectitle">Privacy · lock</h3>
+      {secured ? (
+        <>
+          <p className="tr-setnote">🔒 Encrypted with your password — on this device and in sync. Only the password can read it.</p>
+          <div className="tr-databtns">
+            <button className="tr-databtn" onClick={onLockNow}>Lock now</button>
+            <button className="tr-databtn" onClick={disable} disabled={busy}>Remove lock</button>
+          </div>
+        </>
+      ) : !open ? (
+        <>
+          <p className="tr-setnote">Lock Trinacria behind one password. Your day is encrypted at rest — in this browser and in your synced gist.</p>
+          <button className="tr-databtn" onClick={() => setOpen(true)}>🔒 Set a password</button>
+        </>
+      ) : (
+        <>
+          <p className="tr-setwarn">⚠ If you forget this password your data can’t be recovered — there’s no reset.</p>
+          <input className="tr-noteinput tr-pwfield" type="password" placeholder="new password" autoFocus
+            autoComplete="new-password" value={pw} onChange={(e) => setPw(e.target.value)} />
+          <input className="tr-noteinput tr-pwfield" type="password" placeholder="confirm password"
+            autoComplete="new-password" value={pw2} onChange={(e) => setPw2(e.target.value)} />
+          <div className="tr-databtns">
+            <button className="tr-databtn" onClick={reset}>Cancel</button>
+            <button className="tr-connect" onClick={enable} disabled={busy || !pw}>{busy ? "encrypting…" : "Encrypt my data"}</button>
+          </div>
+        </>
+      )}
+      {msg && <p className="tr-datamsg tr-syncerr">{msg}</p>}
+    </section>
+  );
+}
+
+/* Lock screen — covers everything until the password unlocks the vault. */
+function LockScreen({ remote, onUnlock }) {
+  const [pw, setPw] = useState("");
+  const [err, setErr] = useState("");
+  const [busy, setBusy] = useState(false);
+  const submit = async (e) => {
+    e?.preventDefault();
+    if (busy || !pw) return;
+    setBusy(true); setErr("");
+    const msg = await onUnlock(pw);
+    setBusy(false);
+    if (msg) setErr(msg); else setPw("");
+  };
+  return (
+    <div className="tr-lockscrim">
+      <form className="tr-lockcard" onSubmit={submit} role="dialog" aria-modal="true" aria-label="Locked">
+        <div className="tr-lockmark" aria-hidden="true">🔒</div>
+        <p className="tr-lockeyebrow">Sotto chiave</p>
+        <h2 className="tr-locktitle">Trinacria is locked</h2>
+        <p className="tr-locksub">
+          {remote
+            ? "Your synced day is encrypted. Enter your password to unlock it on this device."
+            : "Enter your password to open your day."}
+        </p>
+        <input className="tr-lockinput" type="password" autoFocus value={pw}
+          placeholder="password" autoComplete="current-password"
+          onChange={(e) => setPw(e.target.value)} aria-label="Password" />
+        {err && <p className="tr-lockerr">{err}</p>}
+        <button className="tr-lockbtn" type="submit" disabled={busy || !pw}>
+          {busy ? "unlocking…" : "Unlock"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+/* Header emblem — click to open the showcase. */
+function Emblem({ activeStream, progress, onOpen }) {
+  return (
+    <button className="tr-emblembtn" onClick={onOpen}
+      aria-label="Open the triskele" title="Play with the triskele ✦">
+      <TriskeleArt activeStream={activeStream} progress={progress} size={78} />
+    </button>
+  );
+}
+
+/* Fullscreen showcase: spins in on open, fills its arms by progress, drag to spin. */
+function EmblemShowcase({ activeStream, progress = {}, onClose }) {
+  const [rot, setRot] = useState(-200);     // start off-angle so it spins into place
+  const [dragging, setDragging] = useState(false);
+  const drag = useRef(null);
+  const ref = useRef(null);
+
+  useEffect(() => {
+    const id = requestAnimationFrame(() => setRot(0));     // animate to rest
+    const esc = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", esc);
+    return () => { cancelAnimationFrame(id); window.removeEventListener("keydown", esc); };
+  }, [onClose]);
+
+  const angleAt = (e) => {
+    const b = ref.current?.getBoundingClientRect();
+    if (!b) return 0;
+    return (Math.atan2(e.clientY - (b.top + b.height / 2), e.clientX - (b.left + b.width / 2)) * 180) / Math.PI;
+  };
+  const onDown = (e) => { setDragging(true); drag.current = { a: angleAt(e), r: rot }; e.currentTarget.setPointerCapture?.(e.pointerId); };
+  const onMove = (e) => { if (drag.current) setRot(drag.current.r + (angleAt(e) - drag.current.a)); };
+  const onUp = () => { setDragging(false); drag.current = null; };
+
+  return (
+    <div className="tr-emblemscrim" onClick={onClose}>
+      <div className="tr-emblemstage" role="dialog" aria-modal="true" aria-label="Triskele" onClick={(e) => e.stopPropagation()}>
+        <button className="tr-modalclose tr-emblemx" onClick={onClose} aria-label="Close">✕</button>
+        <div ref={ref} className={`tr-emblemspin ${dragging ? "drag" : ""}`}
+          onPointerDown={onDown} onPointerMove={onMove} onPointerUp={onUp} onPointerCancel={onUp}
+          style={{ transform: `rotate(${rot}deg)`, transition: dragging ? "none" : "transform 1s cubic-bezier(.2,.85,.25,1)" }}>
+          <TriskeleArt activeStream={activeStream} progress={progress} size={300} />
+        </div>
+        <p className="tr-emblemhint">drag to spin · ogni braccio si accende coi tuoi progressi</p>
+        <div className="tr-emblemlegend">
+          {EMBLEM_ARMS.map((a) => {
+            const pct = Math.round(Math.max(0, Math.min(1, progress[a.stream] || 0)) * 100);
+            return (
+              <div key={a.stream} className={`tr-emblemleg ${activeStream === a.stream ? "live" : ""}`}>
+                <span className="tr-emblemdot" style={{ background: a.c }} />
+                <span className="tr-emblemname">{a.name}</span>
+                <span className="tr-emblempct">{pct}%</span>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </div>
   );
 }
 
